@@ -4,7 +4,7 @@
 set -eu
 
 here=$(cd "$(dirname "$0")/.." && pwd)
-AL=$here/bin/agentlog
+AL=${AGENTLOG_TEST_BIN:-$here/bin/agentlog} # override to test another shell
 root=$(mktemp -d "${TMPDIR:-/tmp}/agentlog-test.XXXXXX")
 trap 'chmod -R u+w "$root" 2>/dev/null; rm -rf "$root"' EXIT
 # Never touch the real home: hooks auto-install into ~/.local/bin and ~/.codex.
@@ -211,8 +211,12 @@ if command -v codex >/dev/null 2>&1; then
   check "install: codex does not allow install" "codex execpolicy check --rules \"$rules\" \"$dest\" install 2>/dev/null | grep -q '\"matchedRules\":\\[\\]'"
 fi
 check "install: AGENTLOG_NO_INSTALL respected" "rm -f \"$dest\"; hj dddd4444 SessionStart | AGENTLOG_NO_INSTALL=1 \"$AL\" hook x >/dev/null; [ ! -e \"$dest\" ]"
-check "install: --no-codex-rule" "rm -f \"$rules\"; \"$AL\" install --no-codex-rule >/dev/null; [ -x \"$dest\" ] && [ ! -e \"$rules\" ]"
-check "install: uninstall removes both" "\"$AL\" install >/dev/null; \"$AL\" install --uninstall >/dev/null; [ ! -e \"$dest\" ] && [ ! -e \"$rules\" ]"
+check "install: --no-codex-rule removes the rule" "\"$AL\" install >/dev/null; \"$AL\" install --no-codex-rule >/dev/null; [ -x \"$dest\" ] && [ ! -e \"$rules\" ]"
+check "install: hook respects --no-codex-rule" "hj eeee5555 SessionStart | \"$AL\" hook x >/dev/null; [ ! -e \"$rules\" ]"
+check "install: --codex-rule opts back in" "\"$AL\" install --codex-rule >/dev/null; [ -f \"$rules\" ]"
+check "install: uninstall removes both" "\"$AL\" install --uninstall >/dev/null; [ ! -e \"$dest\" ] && [ ! -e \"$rules\" ]"
+check "install: hook does not reinstall after uninstall" "hj ffff6666 SessionStart | \"$AL\" hook x >/dev/null; [ ! -e \"$dest\" ] && [ ! -e \"$rules\" ]"
+check "install: explicit install re-enables auto-install" "\"$AL\" install >/dev/null; rm -f \"$dest\"; hj gggg7777 SessionStart | \"$AL\" hook x >/dev/null; [ -x \"$dest\" ]"
 
 # --- hardening: hostile environment and arguments
 fresh harden

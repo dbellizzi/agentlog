@@ -116,18 +116,33 @@ Because every message carries the full session id, a reader can follow up throug
 
 ## Installing
 
-agentlog ships as one plugin for both Claude Code and Codex, from this repo's marketplace (`.claude-plugin/marketplace.json` and `.agents/plugins/marketplace.json`).
+agentlog is one plugin for both Claude Code and Codex. This repo is its own marketplace for both: `.claude-plugin/marketplace.json` for Claude Code and `.agents/plugins/marketplace.json` for Codex.
 
+**Claude Code**
 ```bash
-claude plugin marketplace add ~/Projects/agentlog
+claude plugin marketplace add dbellizzi/agentlog
 claude plugin install agentlog@agentlog
 ```
 
+**Codex**
 ```bash
-codex plugin marketplace add ~/Projects/agentlog
+codex plugin marketplace add dbellizzi/agentlog
+codex plugin add agentlog@agentlog
 ```
+Then start `codex` once and approve the agentlog hooks in `/hooks`. Codex won't run plugin hooks until you approve them. The skill works without the hooks, but new messages are only injected once they're approved.
 
-Then enable `agentlog` from Codex's `/plugins` and approve its hooks.
+That's all. The first session that starts in a git repo installs `~/.local/bin/agentlog` and the Codex sandbox rule (see below). Start a new Codex session afterwards so it loads the rule. If the repo is private, both CLIs clone it with your usual git credentials.
+
+**Updating**
+```bash
+claude plugin marketplace update agentlog && claude plugin update agentlog@agentlog
+```
+```bash
+codex plugin marketplace upgrade agentlog && codex plugin add agentlog@agentlog
+```
+The next session start refreshes `~/.local/bin/agentlog` from the new plugin version.
+
+**Requirements:** POSIX `sh`, `git`, and standard userland tools on macOS or Linux (CI covers both; Linux runs under dash). `perl` is needed on macOS for microsecond timestamps; it ships with the OS. `jq` is optional.
 
 The plugin provides the skill and the hooks (`SessionStart`, `UserPromptSubmit`, `PostToolUse`). Nothing needs to be copied into individual repos. The hooks are cheap and quiet:
 - **Outside a git repo**, they do nothing.
@@ -142,7 +157,10 @@ On each `SessionStart`, the hook runs `agentlog install --quiet`, which:
 1. copies the script to `~/.local/bin/agentlog` (`AGENTLOG_PREFIX` overrides). It's a real copy, not a symlink into a repo, so a sandboxed agent can't edit what it's allowed to run.
 2. if `~/.codex` exists, writes `~/.codex/rules/agentlog.rules`: a Codex execpolicy `prefix_rule` that allows that **absolute path** with only the `write`, `read`, `claims`, `who`, `show`, `whoami` and `dir` subcommands. Codex runs commands that fully match an allow rule outside its sandbox, so Codex in a linked worktree writes straight to the shared board. The worktree-local fallback above remains for anything else.
 
-New Codex sessions pick up the rule. Opt out with `AGENTLOG_NO_INSTALL=1` (no auto-install at all) or by running `agentlog install --no-codex-rule`. `agentlog install --uninstall` removes both files.
+New Codex sessions pick up the rule. Opt-outs made by hand stick, because they're recorded in `~/.config/agentlog/config`, which the hooks' auto-install obeys:
+- `agentlog install --no-codex-rule` removes the rule and keeps it off. `--codex-rule` turns it back on.
+- `agentlog install --uninstall` removes both files and stops auto-install. A plain `agentlog install` turns it back on.
+- `AGENTLOG_NO_INSTALL=1` in the agent's environment skips auto-install entirely.
 
 Because the allowed command runs unsandboxed, the script assumes a hostile caller:
 - **Environment:** it drops every environment variable except the few it reads, and pins `PATH` to system directories, so a planted `git` or `PERL5OPT` can't run code. Codex's parser also refuses `VAR=x cmd` forms, so those never match the rule.
@@ -152,7 +170,9 @@ Because the allowed command runs unsandboxed, the script assumes a hostile calle
 
 ### Developing agentlog
 
-`bin/agentlog` is a symlink to `plugins/agentlog/bin/agentlog`. Plugins are installed as cached copies, so after changing the plugin, update it with `claude plugin update agentlog@agentlog` and by re-syncing the Codex marketplace. To try the working copy directly, run `bin/agentlog`.
+`bin/agentlog` is a symlink to `plugins/agentlog/bin/agentlog`. To release a change, bump `VERSION` in the script and `version` in both plugin manifests together (CI checks that they match), then push. Installed plugins only update to a new version.
+
+For a live dev loop, add your local checkout as the marketplace instead (`claude plugin marketplace add ~/src/agentlog`, `codex plugin marketplace add ~/src/agentlog`). Claude Code reads a local directory marketplace in place, so edits take effect at the next hook run. Codex copies the plugin into its cache, so re-add the marketplace after each change.
 
 ## Tests
 

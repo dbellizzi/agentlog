@@ -19,7 +19,7 @@ PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:/home/linuxb
 export PATH
 unset _v _keep
 
-VERSION=0.2.0
+VERSION=0.3.0
 KINDS="note claim release request reply done"
 
 die() { printf 'agentlog: %s\n' "$*" >&2; exit 1; }
@@ -248,7 +248,7 @@ agentlog — shared message board for agents working in the same repo
   agentlog show ID                         print one message in full
   agentlog whoami                          print this session's identity
   agentlog gc [--days N]                   delete messages older than N days (7)
-  agentlog install [--no-codex-rule] [--uninstall] [--quiet]
+  agentlog install [--codex-rule|--no-codex-rule] [--uninstall] [--quiet]
                  copy to ~/.local/bin and allow it outside the Codex sandbox
   agentlog hook [AGENT]                    hook entry point (reads hook JSON on stdin)
   agentlog dir                             print the store directory
@@ -323,8 +323,8 @@ cmd_write() {
 # Print messages compactly (header line + indented body). File paths on stdin.
 fmt_msgs() {
   # shellcheck disable=SC2016
-  tr '\n' '\0' | xargs -0 awk -v now="$(now_epoch)" '
-    FNR == 1 { inh = 1; id = d = a = s = b = k = t = r = p = e = "" }
+  tr '\n' '\0' | xargs -0 awk -v now="$(now_epoch)" -v brief="${BRIEF:-}" '
+    FNR == 1 { inh = 1; id = d = a = s = b = k = t = r = p = e = ""; nl = nc = cut = 0 }
     inh && /^$/ {
       line = "[" d "] " a ":" substr(s, 1, 8)
       if (b != "" && b != "-") line = line " @" b
@@ -345,7 +345,13 @@ fmt_msgs() {
       else if (key == "Paths") p = val; else if (key == "Expires") e = val
       next
     }
-    { print "    " $0 }
+    # Brief mode (hook injections): at most 3 body lines / 300 chars.
+    brief && cut { next }
+    brief && (nl >= 3 || nc + length($0) > 300) {
+      if (nc < 300 && nl < 3) print "    " substr($0, 1, 300 - nc) "…"
+      print "    … (truncated; agentlog show " id ")"; cut = 1; next
+    }
+    { nl++; nc += length($0); print "    " $0 }
   '
 }
 
@@ -577,24 +583,52 @@ EOF
 
 # Copies this script to $AGENTLOG_PREFIX (~/.local/bin) and, when Codex is
 # present, installs the allow rule. Idempotent; hooks run it on SessionStart.
+#
+# Choices made by hand stick: `--no-codex-rule` and `--uninstall` are recorded
+# in ~/.config/agentlog/config, and the hooks' `--auto` install obeys them.
+# Running `agentlog install` (or `--codex-rule`) by hand opts back in.
+config_file() { printf '%s/.config/agentlog/config\n' "$HOME"; }
+config_get() { sed -n "s/^$1=//p" "$(config_file)" 2>/dev/null | tail -1; }
+config_set() {
+  _c=$(config_file)
+  mkdir -p "$(dirname "$_c")"
+  { grep -v "^$1=" "$_c" 2>/dev/null || :; printf '%s=%s\n' "$1" "$2"; } >"$_c.tmp.$$"
+  mv -f "$_c.tmp.$$" "$_c"
+}
+
 cmd_install() {
-  quiet=0 rule=1 uninstall=0
+  quiet=0 rule='' uninstall=0 auto=0
   while [ $# -gt 0 ]; do
     case $1 in
       --quiet) quiet=1; shift ;;
-      --no-codex-rule) rule=0; shift ;;
+      --auto) auto=1; quiet=1; shift ;;
+      --codex-rule) rule=yes; shift ;;
+      --no-codex-rule) rule=no; shift ;;
       --uninstall) uninstall=1; shift ;;
       *) die "install: unknown option $1" ;;
     esac
   done
   dest=$(install_dest) rules=$(codex_rules) self=$(self_path)
   say() { [ $quiet -eq 1 ] || printf '%s\n' "$*"; }
+  rm_rule() {
+    if [ -f "$rules" ] && grep -q 'Installed by `agentlog install`' "$rules"; then rm -f "$rules"; say "removed $rules"; fi
+  }
 
   if [ $uninstall -eq 1 ]; then
     if [ -f "$dest" ] && grep -q '^# agentlog — a shared' "$dest"; then rm -f "$dest"; say "removed $dest"; fi
-    if [ -f "$rules" ] && grep -q 'Installed by `agentlog install`' "$rules"; then rm -f "$rules"; say "removed $rules"; fi
+    rm_rule
+    config_set install no
+    say "auto-install disabled (run \`agentlog install\` to re-enable)"
     return 0
   fi
+  if [ $auto -eq 1 ]; then
+    [ "$(config_get install)" != no ] || return 0
+    rule=$(config_get codex_rule)
+  else
+    [ "$(config_get install)" != no ] || config_set install yes
+    [ -n "$rule" ] && config_set codex_rule "$rule"
+  fi
+  : "${rule:=yes}"
 
   if [ "$self" != "$dest" ] && ! { [ -f "$dest" ] && [ ! -L "$dest" ] && cmp -s "$self" "$dest"; }; then
     mkdir -p "$(dirname "$dest")"
@@ -605,7 +639,9 @@ cmd_install() {
     say "up to date: $dest"
   fi
 
-  if [ $rule -eq 1 ] && [ -d "$(dirname "$(dirname "$rules")")" ]; then
+  if [ "$rule" = no ]; then
+    rm_rule
+  elif [ -d "$(dirname "$(dirname "$rules")")" ]; then
     text=$(codex_rule_text "$dest")
     if [ "$(cat "$rules" 2>/dev/null)" != "$text" ]; then
       mkdir -p "$(dirname "$rules")"
@@ -637,7 +673,7 @@ cmd_hook() {
   detect_identity
 
   if [ "$event" = SessionStart ] && [ -z "${AGENTLOG_NO_INSTALL:-}" ]; then
-    (cmd_install --quiet) >/dev/null 2>&1 || :
+    (cmd_install --auto) >/dev/null 2>&1 || :
   fi
   ensure_store
   [ -n "$W" ] || exit 0
@@ -656,7 +692,7 @@ cmd_hook() {
     fi
   fi
 
-  unread=$(cmd_read -n 20)
+  unread=$(BRIEF=1; cmd_read -n 10)
   al=$(self_path)
   if [ -x "$(install_dest)" ] && cmp -s "$al" "$(install_dest)"; then al=$(install_dest); fi
   ctx=''
