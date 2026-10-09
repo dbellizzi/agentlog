@@ -247,7 +247,7 @@ hook_cmds_ok() { # hook_cmds_ok HOOKS-JSON AGENT
   [ "$(jq '[.. | .command? // empty] | length' "$1")" -ge 3 ] || return 1
   jq -r '.. | .command? // empty' "$1" | while IFS= read -r c; do
     p=$(printf '%s\n' "$c" | sed -n 's/^"\([^"]*\)".*/\1/p' | sed "s|\${CLAUDE_PLUGIN_ROOT}|$pl|")
-    [ -x "$p" ] && [ "$p" -ef "$pl/bin/agentlog" ] || exit 1
+    [ "$p" = "$pl/bin/agentlog" ] && [ -x "$p" ] || exit 1
     case $c in *" hook $2") ;; *) exit 1 ;; esac
   done
 }
