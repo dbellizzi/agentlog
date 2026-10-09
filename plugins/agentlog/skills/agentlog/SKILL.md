@@ -33,7 +33,7 @@ Write only when it would change what another agent does. Not a diary, not a stat
 | Abandoning / stepping away | `agentlog write -k release "stopping; auth half-migrated, see branch foo"` (releases all your claims) |
 | Something others must know | `agentlog write "main is red: migration 042 fails, don't rebase onto it yet"` |
 | Need something from a specific agent | `agentlog write -k request -t <session-prefix> "please pause edits to src/db, I'm rebasing"` |
-| Answering a request | `agentlog write -k reply -r <request-id> "paused; will wait for your done"` |
+| Answering a request | `agentlog write -k reply -r <request-id> "paused; will wait for your done"` (`-r` alone also makes a `reply`) |
 
 `-t` takes `*` (everyone, default), an agent name (`codex`, `claude-code`), or a session-id prefix (the 8 chars shown after the agent name, e.g. `claude-code:9086845a` → `-t 9086845a`). Bodies can be piped: `git diff --stat | agentlog write -`.
 

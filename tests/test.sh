@@ -106,6 +106,12 @@ check "kind: listed kinds shown" "printf '%s' \"\$out\" | grep -q 'kind request'
 check "kind: other kinds hidden" "! printf '%s' \"\$out\" | grep -q 'kind note'"
 check "kind: unknown kind rejected" "! run claude-code aaaa1111 read --kind bogus 2>/dev/null"
 check "kind: filtered read marks all read" "[ \$(run claude-code aaaa1111 read --kind note | grep -c '^\[') -eq 1 ] && [ -z \"\$(run claude-code aaaa1111 read)\" ]"
+r=$(run codex bbbb2222 write -k request -t aaaa "need an answer")
+run claude-code aaaa1111 write -r "$r" "answer" >/dev/null
+run claude-code aaaa1111 write -k note -r "$r" "aside" >/dev/null
+out=$(run codex bbbb2222 read --kind reply)
+check "kind: -r without -k defaults to reply" "printf '%s' \"\$out\" | grep -q answer"
+check "kind: explicit -k wins over -r default" "! printf '%s' \"\$out\" | grep -q aside"
 
 # --- claims: expiry, release by id, bare release
 fresh claims

@@ -19,7 +19,7 @@ PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:/home/linuxb
 export PATH
 unset _v _keep
 
-VERSION=0.3.1
+VERSION=0.3.2
 KINDS="note claim release request reply done"
 
 die() { printf 'agentlog: %s\n' "$*" >&2; exit 1; }
@@ -239,7 +239,7 @@ agentlog — shared message board for agents working in the same repo
 
   agentlog write [-k KIND] [-t TO] [-r ID] [-p PATHS] [--ttl DUR] MESSAGE...
                  MESSAGE may be "-" (or omitted) to read the body from stdin.
-                 KIND: note (default) | claim | release | request | reply | done
+                 KIND: note (default; reply with -r) | claim | release | request | reply | done
                  TO:   * (default) | agent name (codex, claude-code) | session-id prefix
   agentlog read  [--peek] [--all] [-n N] [--json] [--kind K1,K2]
                  unread messages for this session (--json: JSON Lines)
@@ -269,7 +269,7 @@ parse_ttl() {
 }
 
 cmd_write() {
-  kind=note to='*' re='' paths='' ttl=''
+  kind='' to='*' re='' paths='' ttl=''
   while [ $# -gt 0 ]; do
     case $1 in
       -k | --kind) need "$@"; kind=$2; shift 2 ;;
@@ -283,6 +283,10 @@ cmd_write() {
       *) break ;;
     esac
   done
+  # A message that answers another (-r) is a reply unless -k says otherwise.
+  if [ -z "$kind" ]; then
+    if [ -n "$re" ]; then kind=reply; else kind=note; fi
+  fi
   case " $KINDS " in *" $kind "*) ;; *) die "write: kind must be one of: $KINDS" ;; esac
   if [ $# -eq 0 ] || [ "$*" = - ]; then
     [ -t 0 ] && die "write: no message (pass text or pipe it on stdin)"

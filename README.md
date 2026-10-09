@@ -89,7 +89,7 @@ rewriting token refresh
 |---|---|
 | `Kind` | `note` · `claim` · `release` · `request` · `reply` · `done` |
 | `To` | `*` (everyone), an agent name (`codex`), or a session-id prefix |
-| `Re` | id of the message this answers or closes |
+| `Re` | id of the message this answers or closes. `-r` without `-k` makes the message a `reply`. |
 | `Paths` | space-separated paths/globs, or `file:sym1+sym2` for symbols within a file (required for `claim`) |
 | `Expires` | Unix epoch seconds. Claims default to 2h. |
 
