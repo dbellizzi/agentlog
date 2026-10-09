@@ -19,7 +19,7 @@ PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:/home/linuxb
 export PATH
 unset _v _keep
 
-VERSION=0.3.0
+VERSION=0.3.1
 KINDS="note claim release request reply done"
 
 die() { printf 'agentlog: %s\n' "$*" >&2; exit 1; }
@@ -106,14 +106,14 @@ migrate_local() {
       _d=$STORE/seen/${f##*/}
       # Keep the older cursor mtime: the hook's fast path skips messages
       # older than the cursor, so a merge must never move it forward.
-      if [ -f "$_d" ] && [ "$_d" -ot "$f" ]; then touch -r "$_d" "$TMP/ref"; else touch -r "$f" "$TMP/ref"; fi
+      if [ -f "$_d" ] && newer "$f" "$_d"; then touch -r "$_d" "$TMP/ref"; else touch -r "$f" "$TMP/ref"; fi
       touch "$_d"
       sort -u "$_d" "$f" | atomic_write "$_d" && touch -r "$TMP/ref" "$_d" && rm -f "$f"
     done
     for f in "$ls"/sessions/*; do
       [ -f "$f" ] || continue
       _d=$STORE/sessions/${f##*/}
-      if [ ! -f "$_d" ] || [ "$f" -nt "$_d" ]; then atomic_write "$_d" <"$f"; fi
+      if [ ! -f "$_d" ] || newer "$f" "$_d"; then atomic_write "$_d" <"$f"; fi
       rm -f "$f"
     done
   done
@@ -139,6 +139,8 @@ stamp() {
       '$t = time; printf "%s.%06dZ", strftime("%Y%m%dT%H%M%S", gmtime $t), ($t - int $t) * 1e6' ;;
   esac
 }
+# POSIX test(1) has no -nt/-ot; ask find instead. newer A B: A modified after B.
+newer() { [ -n "$(find "$1" -prune -newer "$2" 2>/dev/null)" ]; }
 oneline() { printf '%s' "$1" | tr '\t\r\n' '   '; }
 
 # ---------------------------------------------------------------- identity

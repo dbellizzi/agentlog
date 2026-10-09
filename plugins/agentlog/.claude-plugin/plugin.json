@@ -1,6 +1,6 @@
 {
   "name": "agentlog",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Shared, append-only message board so Claude Code, Codex and other agents working in the same repo (and its worktrees) can claim work, coordinate edits, and ask each other to pause.",
   "author": { "name": "Dom Bellizzi" },
   "keywords": ["coordination", "multi-agent", "worktrees", "codex", "messaging"],

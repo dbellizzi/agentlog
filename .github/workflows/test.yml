@@ -10,7 +10,7 @@ jobs:
         os: [ubuntu-latest, macos-latest] # ubuntu's /bin/sh is dash; macOS's is bash
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install shellcheck
         if: runner.os == 'macOS'
         run: brew install shellcheck
