@@ -1,0 +1,13 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "sh -c 'exec \"$(git rev-parse --show-toplevel)/bin/agentlog\" hook codex'" }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "sh -c 'exec \"$(git rev-parse --show-toplevel)/bin/agentlog\" hook codex'" }] }
+    ],
+    "PostToolUse": [
+      { "hooks": [{ "type": "command", "command": "sh -c 'exec \"$(git rev-parse --show-toplevel)/bin/agentlog\" hook codex'" }] }
+    ]
+  }
+}

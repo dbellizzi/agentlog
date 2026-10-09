@@ -1,0 +1,425 @@
+#!/bin/sh
+# agentlog — a shared, append-only message board for coding agents working in
+# the same repository. One file per message, written to tmp/ and renamed into
+# msgs/, so concurrent writers never interleave and no locking is needed.
+# See README.md for the protocol.
+set -eu
+
+VERSION=0.1.0
+KINDS="note claim release request reply done"
+
+die() { printf 'agentlog: %s\n' "$*" >&2; exit 1; }
+need() { [ $# -ge 2 ] || die "option $1 needs a value"; }
+
+# ---------------------------------------------------------------- store
+
+# The store lives next to the main worktree's .git (not inside it — Codex's
+# sandbox mounts .git read-only), so every worktree of a repo shares it.
+resolve_store() {
+  if [ -n "${AGENTLOG_DIR:-}" ]; then STORE=$AGENTLOG_DIR; return; fi
+  common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) ||
+    die "not inside a git repository (set AGENTLOG_DIR to use a plain directory)"
+  case $common in
+    */.git) STORE=${common%/.git}/.agentlog ;;
+    *) STORE=$common/agentlog ;; # bare repo
+  esac
+  exclude=$common/info/exclude
+  if ! grep -qsx '/.agentlog/' "$exclude" 2>/dev/null; then
+    { mkdir -p "$common/info" && printf '/.agentlog/\n' >>"$exclude"; } 2>/dev/null || :
+  fi
+}
+
+ensure_store() {
+  resolve_store
+  mkdir -p "$STORE/msgs" "$STORE/tmp" "$STORE/seen" "$STORE/sessions"
+}
+
+# Atomic replace: write to a temp file in the store, then rename over $1.
+atomic_write() {
+  _t=$STORE/tmp/.w.$$.$(rand)
+  cat >"$_t"
+  mv -f "$_t" "$1"
+}
+
+rand() { od -An -N3 -tx1 /dev/urandom | tr -d ' \n'; }
+now_epoch() { date -u +%s; }
+
+# Sortable UTC timestamp with microseconds, so names order like writes do.
+# GNU date has %N; BSD date does not, so fall back to perl (ships with macOS).
+stamp() {
+  _n=$(date -u +%N 2>/dev/null)
+  case $_n in
+    [0-9]*) date -u "+%Y%m%dT%H%M%S.$(printf '%.6s' "$_n")Z" ;;
+    *) perl -MTime::HiRes=time -MPOSIX=strftime -e \
+      '$t = time; printf "%s.%06dZ", strftime("%Y%m%dT%H%M%S", gmtime $t), ($t - int $t) * 1e6' ;;
+  esac
+}
+oneline() { printf '%s' "$1" | tr '\t\r\n' '   '; }
+
+# ---------------------------------------------------------------- identity
+
+# AGENTLOG_SESSION/AGENTLOG_AGENT win; otherwise each agent's own session env.
+detect_identity() {
+  AGENT=${AGENTLOG_AGENT:-}
+  SESSION=${AGENTLOG_SESSION:-}
+  if [ -z "$SESSION" ]; then
+    if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+      SESSION=$CLAUDE_CODE_SESSION_ID; : "${AGENT:=claude-code}"
+    elif [ -n "${CODEX_SESSION_ID:-}${CODEX_THREAD_ID:-}" ]; then
+      SESSION=${CODEX_SESSION_ID:-$CODEX_THREAD_ID}; : "${AGENT:=codex}"
+    elif [ -n "${OPENCODE_SESSION_ID:-}" ]; then
+      SESSION=$OPENCODE_SESSION_ID; : "${AGENT:=opencode}"
+    elif [ -n "${CURSOR_SESSION_ID:-}" ]; then
+      SESSION=$CURSOR_SESSION_ID; : "${AGENT:=cursor}"
+    else
+      SESSION=anon-$PPID
+    fi
+  fi
+  : "${AGENT:=unknown}"
+  SESSION=$(printf '%s' "$SESSION" | tr -cd 'A-Za-z0-9._-')
+  AGENT=$(printf '%s' "$AGENT" | tr -cd 'A-Za-z0-9._-')
+  [ -n "$SESSION" ] || die "empty session id"
+  SHORT=$(printf '%.8s' "$SESSION")
+}
+
+worktree() { git rev-parse --show-toplevel 2>/dev/null || pwd; }
+branch() { git symbolic-ref --short -q HEAD 2>/dev/null || git rev-parse --short HEAD 2>/dev/null || echo -; }
+
+touch_presence() {
+  {
+    printf 'agent=%s\nsession=%s\nbranch=%s\nworktree=%s\nseen=%s\n' \
+      "$AGENT" "$SESSION" "$(branch)" "$(worktree)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } | atomic_write "$STORE/sessions/$SESSION"
+}
+
+# ---------------------------------------------------------------- index
+
+# One TSV line per message, sorted oldest first:
+# name kind agent session to re expires paths branch date
+index() {
+  find "$STORE/msgs" -name '*.msg' -type f -exec awk '
+    FNR == 1 { inh = 1; k = a = s = t = r = e = p = b = d = "" }
+    inh && /^$/ {
+      n = FILENAME; sub(/.*\//, "", n); sub(/\.msg$/, "", n)
+      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", n, k, a, s, t, r, e, p, b, d
+      inh = 0; next
+    }
+    !inh { next }
+    { key = $0; sub(/:.*/, "", key); val = $0; sub(/^[^:]*: ?/, "", val) }
+    key == "Kind" { k = val } key == "Agent" { a = val } key == "Session" { s = val }
+    key == "To" { t = val } key == "Re" { r = val } key == "Expires" { e = val }
+    key == "Paths" { p = val } key == "Branch" { b = val } key == "Date" { d = val }
+  ' {} + | sort
+}
+
+# Active claims (TSV, same columns). A claim ends when it expires, when its
+# owner posts release/done with Re: <claim id>, or when its owner posts a bare
+# `release` (releases everything that session claimed before it).
+active_claims() {
+  index | awk -F '\t' -v now="$(now_epoch)" '
+    { name[NR] = $1; line[NR] = $0 }
+    $2 == "claim" { claim[NR] = 1 }
+    ($2 == "release" || $2 == "done") && $6 != "" { closed[$6] = 1 }
+    $2 == "release" && $6 == "" { relall[$4] = $1 }
+    { sess[NR] = $4; expv[NR] = $7 }
+    END {
+      for (i = 1; i <= NR; i++) {
+        if (!claim[i]) continue
+        if (expv[i] != "" && expv[i] + 0 <= now) continue
+        if (closed[name[i]]) continue
+        if ((sess[i] in relall) && relall[sess[i]] > name[i]) continue
+        print line[i]
+      }
+    }'
+}
+
+fmt_claims() {
+  awk -F '\t' -v now="$(now_epoch)" -v me="$SESSION" '{
+    left = ($7 == "") ? "no expiry" : int(($7 - now) / 60) "m left"
+    who = $3 ":" substr($4, 1, 8); if ($4 == me) who = who " (you)"
+    printf "  %s  %s  [%s]  id=%s\n", who, $8, left, $1
+  }'
+}
+
+# ---------------------------------------------------------------- commands
+
+usage() {
+  cat <<'EOF'
+agentlog — shared message board for agents working in the same repo
+
+  agentlog write [-k KIND] [-t TO] [-r ID] [-p PATHS] [--ttl DUR] MESSAGE...
+                 MESSAGE may be "-" (or omitted) to read the body from stdin.
+                 KIND: note (default) | claim | release | request | reply | done
+                 TO:   * (default) | agent name (codex, claude-code) | session-id prefix
+  agentlog read  [--peek] [--all] [-n N]   unread messages for this session
+  agentlog claims                          active claims (who is working on what)
+  agentlog who                             sessions active in the last 24h
+  agentlog show ID                         print one message in full
+  agentlog whoami                          print this session's identity
+  agentlog gc [--days N]                   delete messages older than N days (7)
+  agentlog hook [AGENT]                    hook entry point (reads hook JSON on stdin)
+  agentlog dir                             print the store directory
+EOF
+}
+
+parse_ttl() {
+  case $1 in
+    *[!0-9smhd]* | "") die "bad --ttl '$1' (use e.g. 30m, 2h, 1d)" ;;
+    *d) echo $((${1%d} * 86400)) ;;
+    *h) echo $((${1%h} * 3600)) ;;
+    *m) echo $((${1%m} * 60)) ;;
+    *s) echo "${1%s}" ;;
+    *) echo $(($1 * 60)) ;;
+  esac
+}
+
+cmd_write() {
+  kind=note to='*' re='' paths='' ttl=''
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -k | --kind) need "$@"; kind=$2; shift 2 ;;
+      -t | --to) need "$@"; to=$2; shift 2 ;;
+      -r | --re) need "$@"; re=$2; shift 2 ;;
+      -p | --paths) need "$@"; paths=$2; shift 2 ;;
+      --ttl) need "$@"; ttl=$2; shift 2 ;;
+      --) shift; break ;;
+      -) break ;;
+      -*) die "write: unknown option $1" ;;
+      *) break ;;
+    esac
+  done
+  case " $KINDS " in *" $kind "*) ;; *) die "write: kind must be one of: $KINDS" ;; esac
+  if [ $# -eq 0 ] || [ "$*" = - ]; then
+    [ -t 0 ] && die "write: no message (pass text or pipe it on stdin)"
+    body=$(cat)
+  else
+    body=$*
+  fi
+  [ -n "$body" ] || die "write: empty message"
+  if [ "$kind" = claim ]; then
+    [ -n "$paths" ] || die "write: a claim needs -p PATHS (what you are working on)"
+    : "${ttl:=2h}"
+  fi
+  expires=''
+  [ -n "$ttl" ] && expires=$(($(now_epoch) + $(parse_ttl "$ttl")))
+
+  ensure_store
+  id=$(stamp)-$SHORT-$(rand)
+  {
+    printf 'Id: %s\nDate: %s\nAgent: %s\nSession: %s\nBranch: %s\nWorktree: %s\nKind: %s\nTo: %s\n' \
+      "$id" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$AGENT" "$SESSION" "$(oneline "$(branch)")" \
+      "$(oneline "$(worktree)")" "$kind" "$(oneline "$to")"
+    [ -n "$re" ] && printf 'Re: %s\n' "$(oneline "$re")"
+    [ -n "$paths" ] && printf 'Paths: %s\n' "$(oneline "$paths")"
+    [ -n "$expires" ] && printf 'Expires: %s\n' "$expires"
+    printf '\n%s\n' "$body"
+  } | atomic_write "$STORE/msgs/$id.msg"
+  touch_presence
+  printf '%s\n' "$id"
+
+  if [ "$kind" = claim ]; then
+    others=$(active_claims | awk -F '\t' -v me="$SESSION" '$4 != me')
+    if [ -n "$others" ]; then
+      printf 'agentlog: other active claims — check for overlap:\n' >&2
+      printf '%s\n' "$others" | fmt_claims >&2
+    fi
+  fi
+}
+
+# Print messages compactly (header line + indented body). File paths on stdin.
+fmt_msgs() {
+  # shellcheck disable=SC2016
+  tr '\n' '\0' | xargs -0 awk -v now="$(now_epoch)" '
+    FNR == 1 { inh = 1; id = d = a = s = b = k = t = r = p = e = "" }
+    inh && /^$/ {
+      line = "[" d "] " a ":" substr(s, 1, 8)
+      if (b != "" && b != "-") line = line " @" b
+      line = line "  " k
+      if (t != "" && t != "*") line = line " → " t
+      if (r != "") line = line "  re=" r
+      if (p != "") line = line "  paths=" p
+      if (e != "") line = line "  (" ((e - now > 0) ? int((e - now) / 60) "m left" : "expired") ")"
+      print line "  id=" id
+      inh = 0; next
+    }
+    inh {
+      key = $0; sub(/:.*/, "", key); val = $0; sub(/^[^:]*: ?/, "", val)
+      if (key == "Id") id = val; else if (key == "Date") d = val
+      else if (key == "Agent") a = val; else if (key == "Session") s = val
+      else if (key == "Branch") b = val; else if (key == "Kind") k = val
+      else if (key == "To") t = val; else if (key == "Re") r = val
+      else if (key == "Paths") p = val; else if (key == "Expires") e = val
+      next
+    }
+    { print "    " $0 }
+  '
+}
+
+# Delivery is at-least-once: the seen list is merged by rename, so two
+# concurrent readers in one session can at worst both show a message.
+# A message is for this session if another session sent it to "*", to this
+# agent's name, or to a prefix of this session id.
+cmd_read() {
+  peek=0 all=0 limit=''
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --peek) peek=1; shift ;;
+      --all) all=1; shift ;;
+      -n) need "$@"; limit=$2; shift 2 ;;
+      *) die "read: unknown option $1" ;;
+    esac
+  done
+  ensure_store
+  seen=$STORE/seen/$SESSION
+  [ -f "$seen" ] || : >"$seen"
+  work=$STORE/tmp/.r.$$.$(rand)
+  if [ $all -eq 1 ]; then
+    index >"$work.new"
+    cp "$work.new" "$work.del"
+  else
+    index | awk -F '\t' -v seen="$seen" '
+      BEGIN { while ((getline l <seen) > 0) s[l] = 1 }
+      !($1 in s)' >"$work.new"
+    awk -F '\t' -v me="$SESSION" -v agent="$AGENT" '
+      $4 != me && ($5 == "*" || $5 == "" || $5 == agent || index(me, $5) == 1)
+    ' "$work.new" >"$work.del"
+  fi
+  total=$(wc -l <"$work.del" | tr -d ' ')
+  if [ -n "$limit" ] && [ "$total" -gt "$limit" ]; then
+    # shellcheck disable=SC2016
+    printf '(%s older unread messages not shown; `agentlog read --all -n %s` to see them)\n' \
+      "$((total - limit))" "$total"
+    tail -n "$limit" "$work.del" >"$work.lim"; mv "$work.lim" "$work.del"
+  fi
+  [ -s "$work.del" ] && cut -f1 "$work.del" | sed "s|.*|$STORE/msgs/&.msg|" | fmt_msgs
+
+  if [ $peek -eq 0 ] && [ -s "$work.new" ]; then
+    cut -f1 "$work.new" | sort -u "$seen" - | atomic_write "$seen"
+  fi
+  rm -f "$work.new" "$work.del"
+  touch_presence
+}
+
+cmd_claims() {
+  ensure_store
+  active_claims | fmt_claims
+}
+
+cmd_who() {
+  ensure_store
+  find "$STORE/sessions" -type f -mtime -1 -exec awk -F= -v me="$SESSION" '
+    FNR == 1 && NR > 1 { out() }
+    { v[$1] = substr($0, length($1) + 2) }
+    END { if (NR) out() }
+    function out() {
+      mark = (v["session"] == me) ? " (you)" : ""
+      printf "  %s  %s:%s%s  @%s  %s\n", v["seen"], v["agent"], substr(v["session"], 1, 8), mark, v["branch"], v["worktree"]
+      delete v
+    }' {} + | sort -r
+}
+
+cmd_show() {
+  [ $# -eq 1 ] || die "show: need a message id"
+  ensure_store
+  f=$STORE/msgs/$1.msg
+  [ -f "$f" ] || die "show: no message $1"
+  cat "$f"
+}
+
+cmd_gc() {
+  days=7
+  [ "${1:-}" = --days ] && { need "$@"; days=$2; }
+  ensure_store
+  find "$STORE/msgs" "$STORE/sessions" -type f -mtime +"$days" -exec rm -f {} +
+  find "$STORE/tmp" -type f -mmin +60 -exec rm -f {} +
+  find "$STORE/msgs" -name '*.msg' -type f | sed 's|.*/||; s/\.msg$//' | sort >"$STORE/tmp/.gc.$$"
+  for s in "$STORE"/seen/*; do
+    [ -f "$s" ] || continue
+    comm -12 "$s" "$STORE/tmp/.gc.$$" | atomic_write "$s"
+  done
+  rm -f "$STORE/tmp/.gc.$$"
+}
+
+# ---------------------------------------------------------------- hooks
+
+json_field() { # json_field NAME < json
+  if command -v jq >/dev/null 2>&1; then
+    jq -r --arg k "$1" '.[$k] // empty' 2>/dev/null
+  else
+    tr -d '\n' | sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p"
+  fi
+}
+
+json_str() {
+  printf '%s' "$1" | tr -d '\000-\010\013\014\016-\037' |
+    sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e "s/$(printf '\t')/\\\\t/g" -e "s/$(printf '\r')//g" |
+    awk 'BEGIN { ORS = ""; print "\"" } NR > 1 { print "\\n" } { print } END { print "\"" }'
+}
+
+# Hook entry point for Claude Code and Codex (same hooks.json contract).
+# Registered on SessionStart, UserPromptSubmit and PostToolUse. Emits
+# additionalContext only when there is something to say, so it is silent
+# (and cheap) on the hot PostToolUse path.
+cmd_hook() {
+  input=$(cat)
+  sid=$(printf '%s' "$input" | json_field session_id)
+  event=$(printf '%s' "$input" | json_field hook_event_name)
+  [ -n "$sid" ] && AGENTLOG_SESSION=$sid
+  [ -n "${1:-}" ] && AGENTLOG_AGENT=$1
+  export AGENTLOG_SESSION AGENTLOG_AGENT
+  detect_identity
+  ensure_store
+
+  unread=$(cmd_read -n 20)
+  # Tell the agent how to invoke us: bare name if on PATH, else absolute path.
+  if [ "$(command -v agentlog 2>/dev/null)" = "$(cd "$(dirname "$0")" && pwd)/agentlog" ]; then
+    al=agentlog
+  else
+    al=$(cd "$(dirname "$0")" && pwd)/agentlog
+  fi
+  ctx=''
+  case $event in
+    SessionStart)
+      claims=$(cmd_claims)
+      ctx="agentlog: other agents may be working in this repo. You are $AGENT:$SHORT (session $SESSION).
+Use the agentlog skill. Command: $al (e.g. \`$al write -k claim -p 'src/foo/**' \"refactoring foo\"\`). Claim areas before larger edits, post when done, reply to requests addressed to you."
+      [ -n "$claims" ] && ctx="$ctx
+
+Active claims:
+$claims"
+      [ -n "$unread" ] && ctx="$ctx
+
+Unread messages:
+$unread"
+      ;;
+    *)
+      [ -n "$unread" ] && ctx="agentlog: new messages from other agents in this repo (you are $AGENT:$SHORT). Act on requests addressed to you; reply with \`$al write -k reply -r <id> ...\`.
+$unread"
+      ;;
+  esac
+  [ -n "$ctx" ] || exit 0
+  printf '{"hookSpecificOutput":{"hookEventName":%s,"additionalContext":%s}}\n' \
+    "$(json_str "${event:-UserPromptSubmit}")" "$(json_str "$ctx")"
+}
+
+# ---------------------------------------------------------------- main
+
+[ $# -gt 0 ] || { usage; exit 1; }
+cmd=$1; shift
+case $cmd in
+  hook) cmd_hook "$@"; exit ;;
+  -h | --help | help) usage; exit 0 ;;
+  --version | version) echo "agentlog $VERSION"; exit 0 ;;
+esac
+detect_identity
+case $cmd in
+  write | w) cmd_write "$@" ;;
+  read | r) cmd_read "$@" ;;
+  claims) cmd_claims ;;
+  who) cmd_who ;;
+  show) cmd_show "$@" ;;
+  whoami) printf '%s:%s (session %s)\n' "$AGENT" "$SHORT" "$SESSION" ;;
+  gc) cmd_gc "$@" ;;
+  dir) resolve_store; printf '%s\n' "$STORE" ;;
+  *) usage >&2; exit 1 ;;
+esac
