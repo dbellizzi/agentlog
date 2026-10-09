@@ -22,5 +22,7 @@ jobs:
           for f in plugins/agentlog/.claude-plugin/plugin.json plugins/agentlog/.codex-plugin/plugin.json; do
             [ "$(jq -r .version "$f")" = "$v" ] || { echo "$f version != script VERSION $v"; exit 1; }
           done
-      - run: shellcheck plugins/agentlog/bin/agentlog tests/test.sh
+      - name: Install Claude Code (tests/test.sh runs claude plugin validate)
+        run: npm install -g @anthropic-ai/claude-code@2.1.282
+      - run: shellcheck plugins/agentlog/bin/agentlog tests/test.sh tests/e2e.sh
       - run: tests/test.sh

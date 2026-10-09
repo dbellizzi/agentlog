@@ -240,4 +240,26 @@ touch -t 202001010000 "$victim"/tmp/keep "$victim"/msgs/notes.txt "$victim"/sess
 AGENTLOG_DIR=$victim run a aaaa1111 gc --days 1
 check "harden: gc only deletes agentlog's own files" "[ -f \"$victim/tmp/keep\" ] && [ -f \"$victim/msgs/notes.txt\" ] && [ -f \"$victim/sessions/config\" ]"
 
+# --- plugin: manifests point at real files; every hook runs this script for its agent
+pl=$here/plugins/agentlog
+hook_cmds_ok() { # hook_cmds_ok HOOKS-JSON AGENT
+  jq -e '.hooks | has("SessionStart") and has("UserPromptSubmit") and has("PostToolUse")' "$1" >/dev/null || return 1
+  [ "$(jq '[.. | .command? // empty] | length' "$1")" -ge 3 ] || return 1
+  jq -r '.. | .command? // empty' "$1" | while IFS= read -r c; do
+    p=$(printf '%s\n' "$c" | sed -n 's/^"\([^"]*\)".*/\1/p' | sed "s|\${CLAUDE_PLUGIN_ROOT}|$pl|")
+    [ -x "$p" ] && [ "$p" -ef "$pl/bin/agentlog" ] || exit 1
+    case $c in *" hook $2") ;; *) exit 1 ;; esac
+  done
+}
+for m in claude:.claude-plugin/plugin.json:claude-code codex:.codex-plugin/plugin.json:codex; do
+  n=${m%%:*} f=${m#*:} f=${f%:*} a=${m##*:}
+  check "plugin: $n manifest's skills and hooks exist" "[ -f \"$pl/\$(jq -r .skills \"$pl/$f\")/agentlog/SKILL.md\" ] && [ -f \"$pl/\$(jq -r .hooks \"$pl/$f\")\" ]"
+  check "plugin: $n hooks run bin/agentlog hook $a" "hook_cmds_ok \"$pl/\$(jq -r .hooks \"$pl/$f\")\" $a"
+done
+if command -v claude >/dev/null; then
+  check "plugin: claude plugin validate --strict" "claude plugin validate --strict \"$pl\" >/dev/null 2>&1"
+else
+  echo "skip plugin: claude plugin validate (no claude CLI)"
+fi
+
 [ $fails -eq 0 ] && echo "all passed" || { echo "$fails failed"; exit 1; }

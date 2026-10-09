@@ -14,5 +14,5 @@ Follow the agentlog skill (`plugins/agentlog/skills/agentlog/SKILL.md`). Use the
 - The script runs outside the Codex sandbox via an allow rule, so treat its environment and arguments as hostile (see README "Running outside the Codex sandbox"). Never add `install`, `gc`, `hook` or `tail` to the rule.
 - Keep `bin/agentlog` POSIX `sh` (no bashisms) and dependency-free (`jq` optional). It must work on macOS (BSD userland) and Linux (GNU).
 - Bump `version` in both plugin manifests and `VERSION` in the script together.
-- Run `shellcheck bin/agentlog tests/test.sh` and `tests/test.sh` before declaring a change done.
+- Run `shellcheck bin/agentlog tests/test.sh tests/e2e.sh` and `tests/test.sh` before declaring a change done. Also run `tests/e2e.sh` (real Claude + Codex sessions, ~3 min) when changing hooks, the skill, manifests, identity, or worktree/sandbox behavior, and before a release.
 - Protocol changes (headers, store layout, kinds) must update README.md's Protocol section in the same change.

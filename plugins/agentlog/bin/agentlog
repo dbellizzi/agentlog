@@ -19,7 +19,7 @@ PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:/home/linuxb
 export PATH
 unset _v _keep
 
-VERSION=0.3.2
+VERSION=0.3.3
 KINDS="note claim release request reply done"
 
 die() { printf 'agentlog: %s\n' "$*" >&2; exit 1; }
@@ -130,11 +130,13 @@ rand() { od -An -N3 -tx1 /dev/urandom | tr -d ' \n'; }
 now_epoch() { date -u +%s; }
 
 # Sortable UTC timestamp with microseconds, so names order like writes do.
-# GNU date has %N; BSD date does not, so fall back to perl (ships with macOS).
+# GNU date and newer macOS date have %N; older BSD date does not, so fall back
+# to perl (ships with macOS). One date call, so the seconds and the fraction
+# come from the same instant (two calls can straddle a second boundary).
 stamp() {
-  _n=$(date -u +%N 2>/dev/null)
-  case $_n in
-    [0-9]*) date -u "+%Y%m%dT%H%M%S.$(printf '%.6s' "$_n")Z" ;;
+  _s=$(date -u '+%Y%m%dT%H%M%S.%N' 2>/dev/null)
+  case ${_s#*.} in
+    [0-9][0-9][0-9][0-9][0-9][0-9]*) printf '%s.%.6sZ\n' "${_s%.*}" "${_s#*.}" ;;
     *) perl -MTime::HiRes=time -MPOSIX=strftime -e \
       '$t = time; printf "%s.%06dZ", strftime("%Y%m%dT%H%M%S", gmtime $t), ($t - int $t) * 1e6' ;;
   esac

@@ -179,3 +179,15 @@ For a live dev loop on one machine, point the agents at your checkout instead of
 ```bash
 tests/test.sh
 ```
+
+The unit suite runs in CI on Ubuntu (dash) and macOS. It runs the script under simulated agents: identities from env vars, hook JSON on stdin, a read-only shared store standing in for the Codex sandbox. It also checks that both manifests and hooks files point at the script, and runs `claude plugin validate --strict` and `codex execpolicy check` when those CLIs are installed.
+
+```bash
+tests/e2e.sh                 # or: tests/e2e.sh claude codex cross worktree
+```
+
+The end-to-end suite drives real agent sessions, so it runs locally, not in CI. It needs both CLIs signed in, takes about 3 minutes, and costs a few model calls. Run it before a release, after a CLI upgrade, or after changing the hooks, skill or manifests. Scenarios:
+- **claude:** this checkout's plugin (`--plugin-dir`, installed copy disabled) delivers a message through its SessionStart hook, and Claude answers a request with a `reply`.
+- **codex:** the *installed* plugin's hooks deliver a message with no board-reading commands, which also proves the hooks are approved. Update the installed plugin first to test unreleased Codex changes.
+- **cross:** Claude sends Codex a request, Codex replies, and a new Claude session receives the reply.
+- **worktree:** Codex in a linked worktree under `workspace-write` writes through the allow rule straight to the shared store, and through the sandbox fallback, which a hook then migrates.
