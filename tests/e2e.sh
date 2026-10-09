@@ -1,24 +1,26 @@
 #!/bin/sh
-# End-to-end tests against real Claude Code and Codex sessions.
+# End-to-end tests against real Claude Code, Codex, Muse and Antigravity sessions.
 #
-# Not run in CI: needs both CLIs signed in, network access, and a handful of
-# model calls (about 2-3 minutes). Run before a release, after a CLI upgrade,
+# Not run in CI: needs the CLIs signed in, network access, and a handful of
+# model calls (about 4-5 minutes for everything). Run before a release, after a CLI upgrade,
 # or after changing the hooks, the skill or the manifests.
 #
 #   tests/e2e.sh                     all scenarios
-#   tests/e2e.sh claude cross        just those (claude codex cross worktree)
+#   tests/e2e.sh claude cross        just those (claude codex cross worktree muse antigravity)
 #
 # Claude Code loads this checkout's plugin (--plugin-dir, with the installed
 # agentlog@dbellizzi disabled for the run). Codex has no per-run plugin
 # directory, so it exercises the INSTALLED agentlog@dbellizzi plugin and its
 # hook approvals; update it first when testing an unreleased Codex change.
+# Muse and Antigravity likewise use their installed agentlog plugin; the muse
+# and antigravity scenarios are skipped when that CLI is not on PATH.
 #
 # E2E_TIMEOUT (seconds per agent run, default 180), E2E_KEEP=1 keeps the
 # scratch directory even when everything passes.
 set -u
 
 here=$(cd "$(dirname "$0")/.." && pwd -P)
-plugin=$here/plugins/agentlog
+plugin=$here
 AL=$plugin/bin/agentlog
 INSTALLED=$HOME/.local/bin/agentlog
 TIMEOUT=${E2E_TIMEOUT:-180}
@@ -26,7 +28,8 @@ TIMEOUT=${E2E_TIMEOUT:-180}
 # Running this from inside an agent session must not leak that session's
 # identity or store into the agents and seed writes below.
 unset AGENTLOG_DIR AGENTLOG_SESSION AGENTLOG_AGENT CLAUDE_CODE_SESSION_ID \
-  CODEX_SESSION_ID CODEX_THREAD_ID OPENCODE_SESSION_ID CURSOR_SESSION_ID
+  CODEX_SESSION_ID CODEX_THREAD_ID OPENCODE_SESSION_ID CURSOR_SESSION_ID \
+  MUSE_SESSION_ID MUSE_THREAD_ID ANTIGRAVITY_CONVERSATION_ID
 
 die() { echo "e2e: $*" >&2; exit 2; }
 for t in claude codex jq git; do command -v "$t" >/dev/null || die "needs $t on PATH"; done
@@ -97,6 +100,33 @@ claude_run() { # claude_run DIR LOG BASH(allow|deny) PROMPT
 codex_run() { # codex_run DIR LOG SANDBOX PROMPT : JSON Lines events in LOG
   (cd "$1" && "$to" "$TIMEOUT" codex exec --json --sandbox "$3" "$4") >"$2" 2>"$2.err"
 }
+
+muse_run() { # muse_run DIR LOG PROMPT
+  (cd "$1" && "$to" "$TIMEOUT" muse exec --workspace "$1" "$3") >"$2" 2>&1
+}
+
+agy_run() { # agy_run DIR LOG PROMPT
+  (cd "$1" && "$to" "$TIMEOUT" agy -p "$3" --print-timeout "${TIMEOUT}s") >"$2" 2>&1
+}
+
+# s_simple AGENT RUNNER : hook delivery (no tools), then answering a request
+s_simple() {
+  agent=$1 runner=$2
+  command -v "${runner%_run}" >/dev/null || { echo "skip $agent: no ${runner%_run} on PATH"; return; }
+  r=$(newrepo "$agent")
+  t1=$(token) t2=$(token)
+  seed "$r" "note for whoever starts next: $t1" >/dev/null
+  "$runner" "$r" "$work/$agent-hook.log" "$QUOTE"
+  check "$agent: SessionStart hook delivers a message (plugin installed and approved?)" \
+    "$work/$agent-hook.log" grep -q "$t1" "$work/$agent-hook.log"
+  req=$(seed "$r" -k request -t "$agent" "please reply with exactly: $t2")
+  "$runner" "$r" "$work/$agent-reply.log" \
+    "Handle any agentlog requests addressed to you, then say done."
+  check "$agent: answers a request with a reply" "$work/$agent-reply.log" \
+    has "$r" ".re == \"$req\" and .agent == \"$agent\" and (.body | contains(\"$t2\"))"
+}
+s_muse() { s_simple muse muse_run; }
+s_antigravity() { s_simple antigravity agy_run; }
 
 # codex_said LOG TOKEN : one of codex's messages contains TOKEN
 codex_said() {
@@ -195,11 +225,11 @@ $AL write 'via sandbox fallback $t2'"
     has_n "$r" 2 ".agent == \"codex\" and (.body | contains(\"$t1\") or contains(\"$t2\"))"
 }
 
-[ $# -gt 0 ] || set -- claude codex cross worktree
+[ $# -gt 0 ] || set -- claude codex cross worktree muse antigravity
 for s in "$@"; do
   case $s in
-    claude | codex | cross | worktree) "s_$s" ;;
-    *) die "unknown scenario '$s' (claude codex cross worktree)" ;;
+    claude | codex | cross | worktree | muse | antigravity) "s_$s" ;;
+    *) die "unknown scenario '$s' (claude codex cross worktree muse antigravity)" ;;
   esac
 done
 

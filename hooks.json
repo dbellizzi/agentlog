@@ -1,0 +1,6 @@
+{
+  "agentlog": {
+    "SessionStart": [{ "type": "command", "command": "./bin/agentlog hook antigravity SessionStart", "timeout": 10 }],
+    "PreInvocation": [{ "type": "command", "command": "./bin/agentlog hook antigravity PreInvocation", "timeout": 10 }]
+  }
+}

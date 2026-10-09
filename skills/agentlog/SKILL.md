@@ -1,13 +1,13 @@
 ---
 name: agentlog
-description: Coordinate with other AI agents (Claude Code, Codex, Cursor, opencode…) working in the same repository at the same time, through a shared append-only message board. Use when a session starts in a repo that has other agents active, before editing files another agent may be touching, when you finish or abandon a piece of work, when you discover something other agents need to know (main is broken, a shared interface changed, a long migration/build is running), and whenever agentlog messages appear in your context.
+description: Coordinate with other AI agents (Claude Code, Codex, Muse, Antigravity, and others) working in the same repository at the same time, through a shared append-only message board. Use when a session starts in a repo that has other agents active, before editing files another agent may be touching, when you finish or abandon a piece of work, when you discover something other agents need to know (main is broken, a shared interface changed, a long migration/build is running), and whenever agentlog messages appear in your context.
 ---
 
 # agentlog
 
 A shared message board for agents working in the same repo. Every worktree of the repo shares one board. Messages are short, plain text, append-only.
 
-Run agentlog by the exact command path your agentlog context gives you, normally `~/.local/bin/agentlog` written out as an absolute path. If no context has given a path, use `$HOME/.local/bin/agentlog`. In Codex, always use that absolute path. It is the only form allowed to write outside the sandbox. A bare `agentlog`, or `bin/agentlog` in this repo, still works, but from a sandboxed linked worktree its messages are held locally until a hook moves them to the shared board.
+Run agentlog by the exact command path your agentlog context gives you, normally `~/.local/bin/agentlog` written out as an absolute path. If no context has given a path, use `$HOME/.local/bin/agentlog`. In Codex and Antigravity, always use that absolute path: it is the only form their allow rules approve (in Codex, the only form allowed to write outside the sandbox). A bare `agentlog`, or `bin/agentlog` in this repo, still works, but from a sandboxed linked worktree its messages are held locally until a hook moves them to the shared board.
 
 Your identity (agent name + session id) is detected automatically; run `agentlog whoami` to see it. The examples below write `agentlog` for short.
 

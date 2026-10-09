@@ -19,7 +19,8 @@ check() { if eval "$2"; then ok "$1"; else fail "$1"; fi; }
 
 fresh() {
   export AGENTLOG_DIR="$root/$1"
-  unset AGENTLOG_SESSION AGENTLOG_AGENT CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID CODEX_THREAD_ID
+  unset AGENTLOG_SESSION AGENTLOG_AGENT CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID CODEX_THREAD_ID \
+    MUSE_SESSION_ID MUSE_THREAD_ID ANTIGRAVITY_CONVERSATION_ID
 }
 run() { _a=$1 _s=$2; shift 2; AGENTLOG_AGENT=$_a AGENTLOG_SESSION=$_s "$AL" "$@"; }
 
@@ -146,10 +147,33 @@ check "hook: new message → valid JSON with escaped body" "printf '%s' \"\$out\
 check "hook: delivered once" "[ -z \"\$(hj aaaa1111 PostToolUse | \"$AL\" hook claude-code)\" ]"
 check "hook: registers presence" "[ -f \"$AGENTLOG_DIR/sessions/aaaa1111\" ] && grep -q agent=claude-code \"$AGENTLOG_DIR/sessions/aaaa1111\""
 
+# --- hook: Muse (Claude-style JSON, side threads ignored) and Antigravity
+fresh hook2
+run codex bbbb2222 write "for muse and antigravity" >/dev/null
+mj() { MUSE_SESSION_ID=muse0001 MUSE_THREAD_ID=$1 "$AL" hook muse; }
+out=$(hj muse0001 SessionStart | mj muse0001)
+check "hook: muse main thread gets Claude-style context" "printf '%s' \"\$out\" | jq -r .hookSpecificOutput.additionalContext | grep -q 'muse:muse0001'"
+run codex bbbb2222 write "second note" >/dev/null
+check "hook: muse side thread stays silent and unregistered" "[ -z \"\$(hj side0001 PostToolUse | mj side0001)\" ] && [ ! -e \"$AGENTLOG_DIR/sessions/side0001\" ]"
+check "hook: muse main thread then receives the message" "hj muse0001 PostToolUse | mj muse0001 | jq -r .hookSpecificOutput.additionalContext | grep -q 'second note'"
+aj() { printf '{"conversationId":"%s","workspacePaths":["%s"],"invocationNum":0}' "$1" "$2"; }
+out=$(aj agyc0001 /nonexistent | "$AL" hook antigravity SessionStart)
+check "hook: antigravity SessionStart injects an ephemeral message" "printf '%s' \"\$out\" | jq -r '.injectSteps[0].ephemeralMessage' | grep -q 'antigravity:agyc0001'"
+check "hook: antigravity PreInvocation silent with nothing new" "[ -z \"\$(aj agyc0001 /nonexistent | \"$AL\" hook antigravity PreInvocation)\" ]"
+run codex bbbb2222 write "third note" >/dev/null
+check "hook: antigravity PreInvocation delivers new messages" "aj agyc0001 /nonexistent | \"$AL\" hook antigravity PreInvocation | jq -r '.injectSteps[0].ephemeralMessage' | grep -q 'third note'"
+agr=$root/agy-repo
+git init -q "$agr"
+check "hook: relative \$0 still resolves after cd (Antigravity runs ./bin/agentlog)" "(cd \"\$(dirname \"$AL\")/..\" && aj agyc0003 \"$agr\" | ./bin/agentlog hook antigravity SessionStart | jq -r '.injectSteps[0].ephemeralMessage' | grep -q 'Command: /[^ ]*/agentlog ')"
+check "hook: antigravity finds the repo from workspacePaths, not its cwd" "(cd \"$root\" && aj agyc0002 \"$agr\" | env -u AGENTLOG_DIR \"$AL\" hook antigravity SessionStart >/dev/null); [ -f \"$agr/.agentlog/sessions/agyc0002\" ]"
+
 # --- identity from agent env vars
 fresh ident
 check "identity: Claude Code env" "[ \"\$(CLAUDE_CODE_SESSION_ID=abc123456789 \"$AL\" whoami)\" = 'claude-code:abc12345 (session abc123456789)' ]"
 check "identity: Codex env" "CODEX_SESSION_ID=01a11f2b-x \"$AL\" whoami | grep -q '^codex:01a11f2b'"
+check "identity: Muse env" "MUSE_SESSION_ID=01a122d1-x \"$AL\" whoami | grep -q '^muse:01a122d1'"
+check "identity: Antigravity env" "ANTIGRAVITY_CONVERSATION_ID=1d2e1aa7-x \"$AL\" whoami | grep -q '^antigravity:1d2e1aa7'"
+check "identity: inner agent beats an inherited Claude Code id" "CLAUDE_CODE_SESSION_ID=outer000 CODEX_THREAD_ID=inner000 \"$AL\" whoami | grep -q '^codex:inner000'"
 
 # --- tail: last N across all senders, with no read cursor changes
 fresh tail
@@ -224,6 +248,27 @@ check "install: uninstall removes both" "\"$AL\" install --uninstall >/dev/null;
 check "install: hook does not reinstall after uninstall" "hj ffff6666 SessionStart | \"$AL\" hook x >/dev/null; [ ! -e \"$dest\" ] && [ ! -e \"$rules\" ]"
 check "install: explicit install re-enables auto-install" "\"$AL\" install >/dev/null; rm -f \"$dest\"; hj gggg7777 SessionStart | \"$AL\" hook x >/dev/null; [ -x \"$dest\" ]"
 
+# --- install: Antigravity permission grants merged into its settings.json
+fresh agy-install
+ags=$HOME/.gemini/antigravity-cli/settings.json
+mkdir -p "$(dirname "$ags")"
+printf '{"model":"m","permissions":{"allow":["command(git diff)"]}}\n' >"$ags"
+"$AL" install >/dev/null
+check "install: antigravity grants cover board subcommands only" "[ \"\$(jq --arg d \"command($dest \" '[.permissions.allow[] | select(startswith(\$d))] | length' \"$ags\")\" -eq 9 ] && ! jq -r '.permissions.allow[]' \"$ags\" | grep -qE ' (install|gc|hook|tail)\)$'"
+check "install: antigravity settings otherwise untouched" "jq -e '.model == \"m\" and .permissions.allow[0] == \"command(git diff)\"' \"$ags\" >/dev/null"
+check "install: antigravity grants idempotent" "\"$AL\" install | grep -q \"up to date: $ags\" && [ \"\$(jq '.permissions.allow | length' \"$ags\")\" -eq 10 ]"
+"$AL" install --no-antigravity-rule >/dev/null
+check "install: --no-antigravity-rule removes only agentlog's grants" "jq -e '.permissions.allow == [\"command(git diff)\"]' \"$ags\" >/dev/null"
+check "install: hook respects --no-antigravity-rule" "hj agy00001 SessionStart | \"$AL\" hook x >/dev/null; jq -e '.permissions.allow == [\"command(git diff)\"]' \"$ags\" >/dev/null"
+"$AL" install --antigravity-rule >/dev/null
+"$AL" install --uninstall >/dev/null
+check "install: uninstall removes the antigravity grants" "jq -e '.permissions.allow == [\"command(git diff)\"]' \"$ags\" >/dev/null"
+"$AL" install >/dev/null
+printf 'not json\n' >"$ags"
+"$AL" install >/dev/null
+check "install: unparsable antigravity settings left alone" "[ \"\$(cat \"$ags\")\" = 'not json' ]"
+rm -rf "$HOME/.gemini"
+
 # --- hardening: hostile environment and arguments
 fresh harden
 mkdir -p "$root/evil"
@@ -241,7 +286,7 @@ AGENTLOG_DIR=$victim run a aaaa1111 gc --days 1
 check "harden: gc only deletes agentlog's own files" "[ -f \"$victim/tmp/keep\" ] && [ -f \"$victim/msgs/notes.txt\" ] && [ -f \"$victim/sessions/config\" ]"
 
 # --- plugin: manifests point at real files; every hook runs this script for its agent
-pl=$here/plugins/agentlog
+pl=$here
 hook_cmds_ok() { # hook_cmds_ok HOOKS-JSON AGENT
   jq -e '.hooks | has("SessionStart") and has("UserPromptSubmit") and has("PostToolUse")' "$1" >/dev/null || return 1
   [ "$(jq '[.. | .command? // empty] | length' "$1")" -ge 3 ] || return 1
@@ -255,6 +300,23 @@ for m in claude:.claude-plugin/plugin.json:claude-code codex:.codex-plugin/plugi
   n=${m%%:*} f=${m#*:} f=${f%:*} a=${m##*:}
   check "plugin: $n manifest's skills and hooks exist" "[ -f \"$pl/\$(jq -r .skills \"$pl/$f\")/agentlog/SKILL.md\" ] && [ -f \"$pl/\$(jq -r .hooks \"$pl/$f\")\" ]"
   check "plugin: $n hooks run bin/agentlog hook $a" "hook_cmds_ok \"$pl/\$(jq -r .hooks \"$pl/$f\")\" $a"
+done
+muse_hooks_ok() { # every Muse hook runs its own wrapper, which runs bin/agentlog hook muse
+  [ "$(jq '.capabilities.hooks | length' "$pl/.muse-plugin/plugin.json")" -eq 3 ] || return 1
+  jq -r '.capabilities.hooks[] | .command[1]' "$pl/.muse-plugin/plugin.json" | while IFS= read -r w; do
+    [ -f "$pl/$w" ] && [ ! -L "$pl/$w" ] && grep -q 'bin/agentlog" hook muse$' "$pl/$w" || exit 1
+  done
+}
+check "plugin: muse hooks run their wrappers for bin/agentlog hook muse" muse_hooks_ok
+check "plugin: muse skill path exists" "[ -f \"$pl/\$(jq -r '.capabilities.skills[0].path' \"$pl/.muse-plugin/plugin.json\")\" ]"
+check "plugin: antigravity hooks run ./bin/agentlog hook antigravity" "[ \"\$(jq -r '.agentlog | to_entries[] | .value[].command' \"$pl/hooks.json\" | grep -c '^\./bin/agentlog hook antigravity \(SessionStart\|PreInvocation\)$')\" -eq 2 ]"
+check "plugin: no symlinks in the plugin (Muse refuses them)" "[ -z \"\$(cd \"$pl\" && find . -path ./.git -prune -o -type l -print)\" ]"
+for v in muse:'muse plugins validate' agy:'agy plugin validate'; do
+  if command -v "${v%%:*}" >/dev/null; then
+    check "plugin: ${v#*:}" "${v#*:} \"$pl\" >/dev/null 2>&1"
+  else
+    echo "skip plugin: ${v#*:} (no ${v%%:*} CLI)"
+  fi
 done
 if command -v claude >/dev/null; then
   check "plugin: claude plugin validate --strict" "claude plugin validate --strict \"$pl\" >/dev/null 2>&1"

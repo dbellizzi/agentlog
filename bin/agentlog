@@ -1,1 +1,848 @@
-../plugins/agentlog/bin/agentlog
+#!/bin/sh
+# shellcheck disable=SC2016 # single-quoted awk/sed programs are intentional
+# agentlog — a shared, append-only message board for coding agents working in
+# the same repository. One file per message, written to tmp/ and renamed into
+# msgs/, so concurrent writers never interleave and no locking is needed.
+# See README.md for the protocol.
+set -eu
+
+# Codex's allow rule (see `agentlog install`) runs this script outside the
+# sandbox, so never trust the caller's environment: keep only what agentlog
+# reads and pin PATH to system locations.
+_keep=" PATH HOME USER LOGNAME TMPDIR LANG LC_ALL LC_CTYPE TERM AGENTLOG_SESSION AGENTLOG_AGENT \
+AGENTLOG_DIR AGENTLOG_PREFIX AGENTLOG_NO_INSTALL CODEX_HOME CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID \
+CODEX_THREAD_ID OPENCODE_SESSION_ID CURSOR_SESSION_ID MUSE_SESSION_ID MUSE_THREAD_ID \
+ANTIGRAVITY_CONVERSATION_ID "
+for _v in $(env | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p'); do
+  case $_keep in *" $_v "*) ;; *) unset "$_v" 2>/dev/null || : ;; esac
+done
+PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin
+export PATH
+unset _v _keep
+
+VERSION=0.4.0
+# Resolve our own path now: hooks may cd into the workspace later, which
+# would break a relative $0 such as Antigravity's ./bin/agentlog.
+SELF=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
+KINDS="note claim release request reply done"
+
+die() { printf 'agentlog: %s\n' "$*" >&2; exit 1; }
+need() { [ $# -ge 2 ] || die "option $1 needs a value"; }
+
+# ---------------------------------------------------------------- store
+
+# The shared store lives next to the main worktree's .git (not inside it —
+# Codex's sandbox mounts .git read-only), so every worktree of a repo shares it.
+#
+# Sandboxed agents in a linked worktree often cannot write outside that
+# worktree. They write to a local store at <worktree>/.agentlog instead
+# (covered by the same /.agentlog/ exclude), readers union every store, and
+# any unsandboxed run (hooks usually are) migrates local messages into the
+# shared store.
+resolve_store() {
+  LOCAL=''
+  if [ -n "${AGENTLOG_DIR:-}" ]; then STORE=$AGENTLOG_DIR; return; fi
+  common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) ||
+    die "not inside a git repository (set AGENTLOG_DIR to use a plain directory)"
+  case $common in
+    */.git) STORE=${common%/.git}/.agentlog ;;
+    *) STORE=$common/agentlog ;; # bare repo
+  esac
+  LOCAL=$(worktree)/.agentlog
+  [ "$LOCAL" = "$STORE" ] && LOCAL=''
+  exclude=$common/info/exclude
+  if ! grep -qsx '/.agentlog/' "$exclude" 2>/dev/null; then
+    { mkdir -p "$common/info" && printf '/.agentlog/\n' >>"$exclude"; } 2>/dev/null || :
+  fi
+}
+
+# Create (or check) a store and prove it is writable. The .agentlog-store
+# marker is what gc and migration require before deleting anything, so a
+# hostile AGENTLOG_DIR or worktree path cannot aim them at unrelated files.
+mkstore() {
+  mkdir -p "$1/msgs" "$1/tmp" "$1/seen" "$1/sessions" 2>/dev/null &&
+    (: >"$1/tmp/.probe.$$") 2>/dev/null && rm -f "$1/tmp/.probe.$$" &&
+    { [ -f "$1/.agentlog-store" ] || : >"$1/.agentlog-store"; }
+}
+is_store() { [ -f "$1/.agentlog-store" ]; }
+
+# Sets W, the store this process writes to, or "" when nothing is writable
+# (a read-only sandbox): reads still work but do not advance the cursor.
+# TMP holds scratch files and is always writable.
+ensure_store() {
+  resolve_store
+  W=''
+  TMP=$(mktemp -d "${TMPDIR:-/tmp}/agentlog.XXXXXX")
+  trap 'rm -rf "$TMP"' 0
+  if mkstore "$STORE"; then
+    W=$STORE
+    migrate_local
+  elif [ -n "$LOCAL" ] && mkstore "$LOCAL"; then
+    W=$LOCAL
+  fi
+}
+
+need_writable() { [ -n "$W" ] || die "cannot write to $STORE${LOCAL:+ or $LOCAL}"; }
+
+# Every store that may hold messages: the shared one, then each worktree's.
+stores() {
+  printf '%s\n' "$STORE"
+  [ -n "${AGENTLOG_DIR:-}" ] && return
+  git worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' |
+    while IFS= read -r wt; do
+      is_store "$wt/.agentlog" && [ "$wt/.agentlog" != "$STORE" ] && printf '%s\n' "$wt/.agentlog"
+    done
+  return 0
+}
+
+# Move messages, read cursors and presence from worktree stores into the
+# shared one. Copy-then-rename keeps each message atomic even across
+# filesystems; a message briefly in both places is deduplicated by id.
+migrate_local() {
+  stores | sed 1d | while IFS= read -r ls; do
+    for f in "$ls"/msgs/*.msg; do
+      [ -f "$f" ] || continue
+      _t=$STORE/msgs/.w.$$.$(rand)
+      cp "$f" "$_t" && mv -f "$_t" "$STORE/msgs/${f##*/}" && rm -f "$f"
+    done
+    for f in "$ls"/seen/*; do
+      [ -f "$f" ] || continue
+      _d=$STORE/seen/${f##*/}
+      # Keep the older cursor mtime: the hook's fast path skips messages
+      # older than the cursor, so a merge must never move it forward.
+      if [ -f "$_d" ] && newer "$f" "$_d"; then touch -r "$_d" "$TMP/ref"; else touch -r "$f" "$TMP/ref"; fi
+      touch "$_d"
+      sort -u "$_d" "$f" | atomic_write "$_d" && touch -r "$TMP/ref" "$_d" && rm -f "$f"
+    done
+    for f in "$ls"/sessions/*; do
+      [ -f "$f" ] || continue
+      _d=$STORE/sessions/${f##*/}
+      if [ ! -f "$_d" ] || newer "$f" "$_d"; then atomic_write "$_d" <"$f"; fi
+      rm -f "$f"
+    done
+  done
+}
+
+# Atomic replace: write a hidden temp file beside $1, then rename over it.
+atomic_write() {
+  _t=$(dirname "$1")/.w.$$.$(rand)
+  cat >"$_t"
+  mv -f "$_t" "$1"
+}
+
+rand() { od -An -N3 -tx1 /dev/urandom | tr -d ' \n'; }
+now_epoch() { date -u +%s; }
+
+# Sortable UTC timestamp with microseconds, so names order like writes do.
+# GNU date and newer macOS date have %N; older BSD date does not, so fall back
+# to perl (ships with macOS). One date call, so the seconds and the fraction
+# come from the same instant (two calls can straddle a second boundary).
+stamp() {
+  _s=$(date -u '+%Y%m%dT%H%M%S.%N' 2>/dev/null)
+  case ${_s#*.} in
+    [0-9][0-9][0-9][0-9][0-9][0-9]*) printf '%s.%.6sZ\n' "${_s%.*}" "${_s#*.}" ;;
+    *) perl -MTime::HiRes=time -MPOSIX=strftime -e \
+      '$t = time; printf "%s.%06dZ", strftime("%Y%m%dT%H%M%S", gmtime $t), ($t - int $t) * 1e6' ;;
+  esac
+}
+# POSIX test(1) has no -nt/-ot; ask find instead. newer A B: A modified after B.
+newer() { [ -n "$(find "$1" -prune -newer "$2" 2>/dev/null)" ]; }
+oneline() { printf '%s' "$1" | tr '\t\r\n' '   '; }
+
+# ---------------------------------------------------------------- identity
+
+# AGENTLOG_SESSION/AGENTLOG_AGENT win; otherwise each agent's own session env.
+detect_identity() {
+  AGENT=${AGENTLOG_AGENT:-}
+  SESSION=${AGENTLOG_SESSION:-}
+  if [ -z "$SESSION" ]; then
+    # An agent started from another agent's shell inherits that agent's
+    # session variable too, and Claude Code's leaks into everything it runs.
+    # So check the agents least likely to be the outer host first.
+    if [ -n "${ANTIGRAVITY_CONVERSATION_ID:-}" ]; then
+      SESSION=$ANTIGRAVITY_CONVERSATION_ID; : "${AGENT:=antigravity}"
+    elif [ -n "${MUSE_SESSION_ID:-}" ]; then
+      SESSION=$MUSE_SESSION_ID; : "${AGENT:=muse}"
+    elif [ -n "${CODEX_SESSION_ID:-}${CODEX_THREAD_ID:-}" ]; then
+      SESSION=${CODEX_SESSION_ID:-$CODEX_THREAD_ID}; : "${AGENT:=codex}"
+    elif [ -n "${OPENCODE_SESSION_ID:-}" ]; then
+      SESSION=$OPENCODE_SESSION_ID; : "${AGENT:=opencode}"
+    elif [ -n "${CURSOR_SESSION_ID:-}" ]; then
+      SESSION=$CURSOR_SESSION_ID; : "${AGENT:=cursor}"
+    elif [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+      SESSION=$CLAUDE_CODE_SESSION_ID; : "${AGENT:=claude-code}"
+    else
+      SESSION=anon-$PPID
+    fi
+  fi
+  : "${AGENT:=unknown}"
+  SESSION=$(printf '%s' "$SESSION" | tr -cd 'A-Za-z0-9._-' | sed 's/^[.-]*//')
+  AGENT=$(printf '%s' "$AGENT" | tr -cd 'A-Za-z0-9._-' | sed 's/^[.-]*//')
+  [ -n "$SESSION" ] || die "empty session id"
+  SHORT=$(printf '%.8s' "$SESSION")
+}
+
+worktree() { git rev-parse --show-toplevel 2>/dev/null || pwd; }
+branch() { git symbolic-ref --short -q HEAD 2>/dev/null || git rev-parse --short HEAD 2>/dev/null || echo -; }
+
+touch_presence() {
+  [ -n "$W" ] || return 0
+  {
+    printf 'agent=%s\nsession=%s\nbranch=%s\nworktree=%s\nseen=%s\n' \
+      "$AGENT" "$SESSION" "$(branch)" "$(worktree)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } | atomic_write "$W/sessions/$SESSION"
+}
+
+# ---------------------------------------------------------------- index
+
+# One TSV line per message across all stores, sorted oldest first:
+# name kind agent session to re expires paths branch date path
+index() {
+  stores | while IFS= read -r st; do
+    [ -d "$st/msgs" ] && find "$st/msgs" -name '*.msg' -type f
+  done | tr '\n' '\0' | xargs -0 awk '
+    FNR == 1 { inh = 1; k = a = s = t = r = e = p = b = d = "" }
+    inh && /^$/ {
+      n = FILENAME; sub(/.*\//, "", n); sub(/\.msg$/, "", n)
+      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", n, k, a, s, t, r, e, p, b, d, FILENAME
+      inh = 0; next
+    }
+    !inh { next }
+    { key = $0; sub(/:.*/, "", key); val = $0; sub(/^[^:]*: ?/, "", val) }
+    key == "Kind" { k = val } key == "Agent" { a = val } key == "Session" { s = val }
+    key == "To" { t = val } key == "Re" { r = val } key == "Expires" { e = val }
+    key == "Paths" { p = val } key == "Branch" { b = val } key == "Date" { d = val }
+  ' /dev/null | sort | awk -F '\t' '!seen[$1]++' # /dev/null: never read stdin
+}
+
+# Active claims (TSV, same columns). A claim ends when it expires, when its
+# owner posts release/done with Re: <claim id>, or when its owner posts a bare
+# `release` (releases everything that session claimed before it).
+active_claims() {
+  index | awk -F '\t' -v now="$(now_epoch)" '
+    { name[NR] = $1; line[NR] = $0 }
+    $2 == "claim" { claim[NR] = 1 }
+    ($2 == "release" || $2 == "done") && $6 != "" { closed[$6] = 1 }
+    $2 == "release" && $6 == "" { relall[$4] = $1 }
+    { sess[NR] = $4; expv[NR] = $7 }
+    END {
+      for (i = 1; i <= NR; i++) {
+        if (!claim[i]) continue
+        if (expv[i] != "" && expv[i] + 0 <= now) continue
+        if (closed[name[i]]) continue
+        if ((sess[i] in relall) && relall[sess[i]] > name[i]) continue
+        print line[i]
+      }
+    }'
+}
+
+fmt_claims() {
+  awk -F '\t' -v now="$(now_epoch)" -v me="$SESSION" '{
+    left = ($7 == "") ? "no expiry" : int(($7 - now) / 60) "m left"
+    who = $3 ":" substr($4, 1, 8); if ($4 == me) who = who " (you)"
+    printf "  %s  %s  [%s]  id=%s\n", who, $8, left, $1
+  }'
+}
+
+# ---------------------------------------------------------------- commands
+
+usage() {
+  cat <<'EOF'
+agentlog — shared message board for agents working in the same repo
+
+  agentlog write [-k KIND] [-t TO] [-r ID] [-p PATHS] [--ttl DUR] MESSAGE...
+                 MESSAGE may be "-" (or omitted) to read the body from stdin.
+                 KIND: note (default; reply with -r) | claim | release | request | reply | done
+                 TO:   * (default) | agent name (codex, claude-code) | session-id prefix
+  agentlog read  [--peek] [--all] [-n N] [--json] [--kind K1,K2]
+                 unread messages for this session (--json: JSON Lines)
+                 [--from AGENT] show only that agent name or session-id prefix; marks all read
+  agentlog tail [-n N] [-f]                last N messages (10); follow every 2s
+  agentlog claims                          active claims (who is working on what)
+  agentlog who                             sessions active in the last 24h
+  agentlog show ID                         print one message in full
+  agentlog whoami                          print this session's identity
+  agentlog gc [--days N]                   delete messages older than N days (7)
+  agentlog install [--codex-rule|--no-codex-rule] [--antigravity-rule|--no-antigravity-rule]
+                 [--uninstall] [--quiet]
+                 copy to ~/.local/bin; allow it in Codex (unsandboxed) and Antigravity (unprompted)
+  agentlog hook AGENT [EVENT]              hook entry point (reads hook JSON on stdin)
+  agentlog dir                             print the store directory
+EOF
+}
+
+parse_ttl() {
+  case $1 in
+    *[!0-9smhd]* | "") die "bad --ttl '$1' (use e.g. 30m, 2h, 1d)" ;;
+    *d) echo $((${1%d} * 86400)) ;;
+    *h) echo $((${1%h} * 3600)) ;;
+    *m) echo $((${1%m} * 60)) ;;
+    *s) echo "${1%s}" ;;
+    *) echo $(($1 * 60)) ;;
+  esac
+}
+
+cmd_write() {
+  kind='' to='*' re='' paths='' ttl=''
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -k | --kind) need "$@"; kind=$2; shift 2 ;;
+      -t | --to) need "$@"; to=$2; shift 2 ;;
+      -r | --re) need "$@"; re=$2; shift 2 ;;
+      -p | --paths) need "$@"; paths=$2; shift 2 ;;
+      --ttl) need "$@"; ttl=$2; shift 2 ;;
+      --) shift; break ;;
+      -) break ;;
+      -*) die "write: unknown option $1" ;;
+      *) break ;;
+    esac
+  done
+  # A message that answers another (-r) is a reply unless -k says otherwise.
+  if [ -z "$kind" ]; then
+    if [ -n "$re" ]; then kind=reply; else kind=note; fi
+  fi
+  case " $KINDS " in *" $kind "*) ;; *) die "write: kind must be one of: $KINDS" ;; esac
+  if [ $# -eq 0 ] || [ "$*" = - ]; then
+    [ -t 0 ] && die "write: no message (pass text or pipe it on stdin)"
+    body=$(cat)
+  else
+    body=$*
+  fi
+  [ -n "$body" ] || die "write: empty message"
+  if [ "$kind" = claim ]; then
+    [ -n "$paths" ] || die "write: a claim needs -p PATHS (what you are working on)"
+    : "${ttl:=2h}"
+  fi
+  expires=''
+  [ -n "$ttl" ] && expires=$(($(now_epoch) + $(parse_ttl "$ttl")))
+
+  ensure_store
+  need_writable
+  id=$(stamp)-$SHORT-$(rand)
+  {
+    printf 'Id: %s\nDate: %s\nAgent: %s\nSession: %s\nBranch: %s\nWorktree: %s\nKind: %s\nTo: %s\n' \
+      "$id" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$AGENT" "$SESSION" "$(oneline "$(branch)")" \
+      "$(oneline "$(worktree)")" "$kind" "$(oneline "$to")"
+    [ -n "$re" ] && printf 'Re: %s\n' "$(oneline "$re")"
+    [ -n "$paths" ] && printf 'Paths: %s\n' "$(oneline "$paths")"
+    [ -n "$expires" ] && printf 'Expires: %s\n' "$expires"
+    printf '\n%s\n' "$body"
+  } | atomic_write "$W/msgs/$id.msg"
+  touch_presence
+  printf '%s\n' "$id"
+
+  if [ "$kind" = claim ]; then
+    others=$(active_claims | awk -F '\t' -v me="$SESSION" '$4 != me')
+    if [ -n "$others" ]; then
+      printf 'agentlog: other active claims — check for overlap:\n' >&2
+      printf '%s\n' "$others" | fmt_claims >&2
+    fi
+  fi
+}
+
+# Print messages compactly (header line + indented body). File paths on stdin.
+fmt_msgs() {
+  # shellcheck disable=SC2016
+  tr '\n' '\0' | xargs -0 awk -v now="$(now_epoch)" -v brief="${BRIEF:-}" '
+    FNR == 1 { inh = 1; id = d = a = s = b = k = t = r = p = e = ""; nl = nc = cut = 0 }
+    inh && /^$/ {
+      line = "[" d "] " a ":" substr(s, 1, 8)
+      if (b != "" && b != "-") line = line " @" b
+      line = line "  " k
+      if (t != "" && t != "*") line = line " → " t
+      if (r != "") line = line "  re=" r
+      if (p != "") line = line "  paths=" p
+      if (e != "") line = line "  (" ((e - now > 0) ? int((e - now) / 60) "m left" : "expired") ")"
+      print line "  id=" id
+      inh = 0; next
+    }
+    inh {
+      key = $0; sub(/:.*/, "", key); val = $0; sub(/^[^:]*: ?/, "", val)
+      if (key == "Id") id = val; else if (key == "Date") d = val
+      else if (key == "Agent") a = val; else if (key == "Session") s = val
+      else if (key == "Branch") b = val; else if (key == "Kind") k = val
+      else if (key == "To") t = val; else if (key == "Re") r = val
+      else if (key == "Paths") p = val; else if (key == "Expires") e = val
+      next
+    }
+    # Brief mode (hook injections): at most 3 body lines / 300 chars.
+    brief && cut { next }
+    brief && (nl >= 3 || nc + length($0) > 300) {
+      if (nc < 300 && nl < 3) print "    " substr($0, 1, 300 - nc) "…"
+      print "    … (truncated; agentlog show " id ")"; cut = 1; next
+    }
+    { nl++; nc += length($0); print "    " $0 }
+  '
+}
+
+# Print messages as JSON Lines, one object per message. File paths on stdin.
+# Missing headers are null; expires is a number. Escaping is done per
+# character because backslashes in gsub replacements differ across awks.
+fmt_json() {
+  # shellcheck disable=SC2016
+  tr '\n' '\0' | xargs -0 awk '
+    BEGIN {
+      for (i = 1; i < 32; i++) esc[sprintf("%c", i)] = sprintf("\\u%04x", i)
+      esc["\n"] = "\\n"; esc["\t"] = "\\t"; esc["\r"] = "\\r"
+      esc["\""] = "\\\""; esc["\\"] = "\\\\"
+    }
+    function js(v,   o, c, i) {
+      o = ""
+      for (i = 1; i <= length(v); i++) { c = substr(v, i, 1); o = o ((c in esc) ? esc[c] : c) }
+      return "\"" o "\""
+    }
+    function opt(v) { return (v == "") ? "null" : js(v) }
+    function out() {
+      if (!any) return
+      printf "{\"id\":%s,\"date\":%s,\"agent\":%s,\"session\":%s,\"branch\":%s,\"kind\":%s,\"to\":%s,\"re\":%s,\"paths\":%s,\"expires\":%s,\"body\":%s}\n",
+        opt(h["Id"]), opt(h["Date"]), opt(h["Agent"]), opt(h["Session"]), opt(h["Branch"]),
+        opt(h["Kind"]), opt(h["To"]), opt(h["Re"]), opt(h["Paths"]),
+        (h["Expires"] ~ /^[0-9]+$/) ? h["Expires"] : "null", js(body)
+    }
+    FNR == 1 { out(); any = 1; inh = 1; body = ""; nb = 0; split("", h) }
+    inh && /^$/ { inh = 0; next }
+    inh { key = $0; sub(/:.*/, "", key); val = $0; sub(/^[^:]*: ?/, "", val); h[key] = val; next }
+    { body = (nb++ ? body "\n" : "") $0 }
+    END { out() }
+  '
+}
+
+# Delivery is at-least-once: the seen list is merged by rename, so two
+# concurrent readers in one session can at worst both show a message.
+# A message is for this session if another session sent it to "*", to this
+# agent's name, or to a prefix of this session id.
+cmd_read() {
+  read_from=''
+  peek=0 all=0 limit='' fmt=fmt_msgs
+  read_kind=''
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --from) need "$@"; [ -n "$2" ] || die "read: --from needs a non-empty value"; read_from=$2; shift 2 ;;
+      --peek) peek=1; shift ;;
+      --all) all=1; shift ;;
+      --json) fmt=fmt_json; shift ;;
+      -n) need "$@"; limit=$2; shift 2 ;;
+      --kind) need "$@"; read_kind=$2; shift 2 ;;
+      *) die "read: unknown option $1" ;;
+    esac
+  done
+  ensure_store
+  work=$TMP/r
+  : >"$work.start"
+  seen=$work.seen
+  cat "$STORE/seen/$SESSION" ${LOCAL:+"$LOCAL/seen/$SESSION"} 2>/dev/null | sort -u >"$seen" || :
+  if [ $all -eq 1 ]; then
+    index >"$work.new"
+    awk -F '\t' -v from="$read_from" '
+      from == "" || $3 == from || index($4, from) == 1
+    ' "$work.new" >"$work.del"
+  else
+    index | awk -F '\t' -v seen="$seen" '
+      BEGIN { while ((getline l <seen) > 0) s[l] = 1 }
+      !($1 in s)' >"$work.new"
+    awk -F '\t' -v me="$SESSION" -v agent="$AGENT" -v from="$read_from" '
+      $4 != me && ($5 == "*" || $5 == "" || $5 == agent || index(me, $5) == 1) &&
+        (from == "" || $3 == from || index($4, from) == 1)
+    ' "$work.new" >"$work.del"
+  fi
+  if [ -n "$read_kind" ]; then
+    # Only hide non-matching kinds from output; $work.new still marks all read.
+    for k in $(printf '%s' "$read_kind" | tr ',' ' '); do
+      case " $KINDS " in *" $k "*) ;; *) die "read: --kind must be from: $KINDS" ;; esac
+    done
+    awk -F '\t' -v kinds=",$read_kind," 'index(kinds, "," $2 ",")' "$work.del" >"$work.k"
+    mv "$work.k" "$work.del"
+  fi
+  total=$(wc -l <"$work.del" | tr -d ' ')
+  if [ -n "$limit" ] && [ "$total" -gt "$limit" ]; then
+    # shellcheck disable=SC2016
+    notice=$(printf '(%s older unread messages not shown; `agentlog read --all -n %s` to see them)' \
+      "$((total - limit))" "$total")
+    if [ "$fmt" = fmt_json ]; then printf '%s\n' "$notice" >&2; else printf '%s\n' "$notice"; fi
+    tail -n "$limit" "$work.del" >"$work.lim"; mv "$work.lim" "$work.del"
+  fi
+  [ -s "$work.del" ] && cut -f11 "$work.del" | "$fmt"
+
+  if [ $peek -eq 0 ] && [ -n "$W" ] && [ -s "$work.new" ]; then
+    cut -f1 "$work.new" | sort -u "$seen" - | atomic_write "$W/seen/$SESSION"
+  fi
+  # Cursor mtime = when this read's snapshot began, not when it finished, so
+  # the hook's "anything newer?" check cannot skip a message that landed
+  # mid-read.
+  if [ -n "$W" ]; then
+    [ -f "$W/seen/$SESSION" ] || : >"$W/seen/$SESSION"
+    touch -r "$work.start" "$W/seen/$SESSION"
+  fi
+  touch_presence
+}
+
+# Observe all senders without changing this session's read cursor. Keep a
+# snapshot of ids so following also catches messages published out of order.
+cmd_tail() {
+  limit=10 follow=0
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -n) need "$@"; limit=$2; shift 2 ;;
+      -f) follow=1; shift ;;
+      *) die "tail: unknown option $1" ;;
+    esac
+  done
+  case $limit in
+    '' | *[!0-9]*) die "tail: -n needs a non-negative integer" ;;
+  esac
+  ensure_store
+  work=$TMP/tail
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  index >"$work.index"
+  cut -f1 "$work.index" >"$work.ids"
+  tail -n "$limit" "$work.index" >"$work.del"
+  touch_presence
+  while :; do
+    if [ -s "$work.del" ]; then
+      cut -f11 "$work.del" | fmt_msgs
+    fi
+    [ "$follow" -eq 1 ] || break
+    sleep 2
+    index >"$work.index"
+    awk -F '\t' -v seen="$work.ids" '
+      BEGIN { while ((getline id <seen) > 0) s[id] = 1 }
+      !($1 in s)' "$work.index" >"$work.del"
+    cut -f1 "$work.index" >"$work.ids"
+  done
+}
+
+cmd_claims() {
+  ensure_store
+  active_claims | fmt_claims
+}
+
+cmd_who() {
+  ensure_store
+  stores | while IFS= read -r st; do
+    [ -d "$st/sessions" ] && find "$st/sessions" -type f -mtime -1
+  done | tr '\n' '\0' | xargs -0 awk -F= -v me="$SESSION" '
+    FNR == 1 && NR > 1 { out() }
+    { v[$1] = substr($0, length($1) + 2) }
+    END { if (NR) out() }
+    function out() {
+      mark = (v["session"] == me) ? " (you)" : ""
+      printf "%s\t%s\t  %s  %s:%s%s  @%s  %s\n", v["seen"], v["session"], v["seen"], v["agent"], substr(v["session"], 1, 8), mark, v["branch"], v["worktree"]
+      delete v
+    }' /dev/null | sort -r | awk -F '\t' '!u[$2]++' | cut -f3-
+}
+
+cmd_show() {
+  [ $# -eq 1 ] || die "show: need a message id"
+  ensure_store
+  f=$(index | awk -F '\t' -v id="$1" '$1 == id { print $11 }')
+  [ -n "$f" ] || die "show: no message $1"
+  cat "$f"
+}
+
+cmd_gc() {
+  days=7
+  [ "${1:-}" = --days ] && { need "$@"; days=$2; }
+  ensure_store
+  stores | while IFS= read -r st; do
+    is_store "$st" || continue
+    # Only ever delete files agentlog names: messages, presence records and
+    # its own temp files, never anything else that happens to live there.
+    find "$st/msgs" -maxdepth 1 -type f -name '2[0-9]*T*Z-*.msg' -mtime +"$days" -exec rm -f {} + 2>/dev/null || :
+    find "$st/sessions" -maxdepth 1 -type f -mtime +"$days" -exec grep -l '^agent=' {} + 2>/dev/null |
+      tr '\n' '\0' | xargs -0 rm -f
+    find "$st/tmp" "$st/msgs" "$st/seen" "$st/sessions" -maxdepth 1 -type f \
+      \( -name '.w.*' -o -name '.probe.*' \) -mmin +60 -exec rm -f {} + 2>/dev/null || :
+  done
+  [ -n "$W" ] || return 0
+  index | cut -f1 >"$TMP/ids"
+  for f in "$W"/seen/*; do
+    [ -f "$f" ] || continue
+    sort "$f" | comm -12 - "$TMP/ids" | atomic_write "$f"
+  done
+}
+
+# ---------------------------------------------------------------- hooks
+
+json_field() { # json_field NAME < json
+  if command -v jq >/dev/null 2>&1; then
+    jq -r --arg k "$1" '.[$k] // empty' 2>/dev/null
+  else
+    tr -d '\n' | sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p"
+  fi
+}
+
+json_first() { # json_first NAME < json : first string in the array NAME
+  if command -v jq >/dev/null 2>&1; then
+    jq -r --arg k "$1" '.[$k][0]? // empty' 2>/dev/null
+  else
+    tr -d '\n' | sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\[[[:space:]]*\"\([^\"]*\)\".*/\1/p"
+  fi
+}
+
+json_str() {
+  printf '%s' "$1" | tr -d '\000-\010\013\014\016-\037' |
+    sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e "s/$(printf '\t')/\\\\t/g" -e "s/$(printf '\r')//g" |
+    awk 'BEGIN { ORS = ""; print "\"" } NR > 1 { print "\\n" } { print } END { print "\"" }'
+}
+
+# ---------------------------------------------------------------- install
+
+self_path() { printf '%s\n' "$SELF"; }
+install_dest() { printf '%s/agentlog\n' "${AGENTLOG_PREFIX:-$HOME/.local/bin}"; }
+codex_rules() { printf '%s/rules/agentlog.rules\n' "${CODEX_HOME:-$HOME/.codex}"; }
+
+# Codex execpolicy: commands whose every segment matches an allow rule run
+# outside the sandbox. Allow only the installed copy (outside any workspace,
+# so a sandboxed agent cannot edit it) and only board subcommands — never
+# install, gc, tail -f or hook.
+codex_rule_text() {
+  cat <<EOF
+# Installed by \`agentlog install\` (agentlog $VERSION). Lets Codex run the
+# installed agentlog outside its sandbox, so agents in linked worktrees can
+# write to the shared board. Remove with \`agentlog install --uninstall\`.
+prefix_rule(
+    pattern = ["$1", ["write", "w", "read", "r", "claims", "who", "show", "whoami", "dir"]],
+    decision = "allow",
+    justification = "agentlog: shared message board for agents working in the same repo",
+)
+EOF
+}
+
+# Antigravity CLI permission grants: `command(<prefix>)` entries under
+# permissions.allow in its settings.json skip the approval prompt, which
+# headless runs otherwise auto-deny. Same subcommands as the Codex rule. Not
+# a sandbox bypass. Merged with jq so the rest of the file is untouched;
+# skipped without jq, or when the file does not parse.
+agy_settings() { printf '%s/.gemini/antigravity-cli/settings.json\n' "$HOME"; }
+agy_grants() { # agy_grants DEST -> JSON array of command(...) grants
+  printf '['; _sep=''
+  for _s in write w read r claims who show whoami dir; do
+    printf '%s"command(%s %s)"' "$_sep" "$1" "$_s"; _sep=,
+  done
+  printf ']\n'
+}
+agy_edit() { # agy_edit add|remove DEST
+  _f=$(agy_settings)
+  [ -d "$(dirname "$_f")" ] && command -v jq >/dev/null 2>&1 || return 0
+  [ -f "$_f" ] || [ "$1" = add ] || return 0
+  _in=$(cat "$_f" 2>/dev/null || :)
+  [ -n "$_in" ] || _in='{}'
+  if [ "$1" = add ]; then
+    _p='(.permissions.allow // []) as $a | .permissions.allow = $a + ($g - $a)'
+  else
+    _p='if (.permissions.allow | type) == "array" then .permissions.allow -= $g else . end'
+  fi
+  _out=$(printf '%s' "$_in" | jq --argjson g "$(agy_grants "$2")" "$_p" 2>/dev/null) || return 0
+  if [ "$(printf '%s' "$_in" | jq -c . 2>/dev/null)" = "$(printf '%s' "$_out" | jq -c .)" ]; then
+    say "up to date: $_f"
+    return 0
+  fi
+  (umask 077 && printf '%s\n' "$_out" >"$_f.tmp.$$") && mv -f "$_f.tmp.$$" "$_f"
+  if [ "$1" = add ]; then say "antigravity grants: $_f (agy runs $2 board commands without asking)"; else say "removed agentlog grants from $_f"; fi
+}
+
+# Copies this script to $AGENTLOG_PREFIX (~/.local/bin) and, when Codex or
+# Antigravity is present, installs their allow rules. Idempotent; hooks run
+# it on SessionStart.
+#
+# Choices made by hand stick: `--no-codex-rule` and `--uninstall` are recorded
+# in ~/.config/agentlog/config, and the hooks' `--auto` install obeys them.
+# Running `agentlog install` (or `--codex-rule`) by hand opts back in.
+config_file() { printf '%s/.config/agentlog/config\n' "$HOME"; }
+config_get() { sed -n "s/^$1=//p" "$(config_file)" 2>/dev/null | tail -1; }
+config_set() {
+  _c=$(config_file)
+  mkdir -p "$(dirname "$_c")"
+  { grep -v "^$1=" "$_c" 2>/dev/null || :; printf '%s=%s\n' "$1" "$2"; } >"$_c.tmp.$$"
+  mv -f "$_c.tmp.$$" "$_c"
+}
+
+cmd_install() {
+  quiet=0 rule='' arule='' uninstall=0 auto=0
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --quiet) quiet=1; shift ;;
+      --auto) auto=1; quiet=1; shift ;;
+      --codex-rule) rule=yes; shift ;;
+      --no-codex-rule) rule=no; shift ;;
+      --antigravity-rule) arule=yes; shift ;;
+      --no-antigravity-rule) arule=no; shift ;;
+      --uninstall) uninstall=1; shift ;;
+      *) die "install: unknown option $1" ;;
+    esac
+  done
+  dest=$(install_dest) rules=$(codex_rules) self=$(self_path)
+  say() { [ $quiet -eq 1 ] || printf '%s\n' "$*"; }
+  rm_rule() {
+    if [ -f "$rules" ] && grep -q 'Installed by `agentlog install`' "$rules"; then rm -f "$rules"; say "removed $rules"; fi
+  }
+
+  if [ $uninstall -eq 1 ]; then
+    if [ -f "$dest" ] && grep -q '^# agentlog — a shared' "$dest"; then rm -f "$dest"; say "removed $dest"; fi
+    rm_rule
+    agy_edit remove "$dest"
+    config_set install no
+    say "auto-install disabled (run \`agentlog install\` to re-enable)"
+    return 0
+  fi
+  if [ $auto -eq 1 ]; then
+    [ "$(config_get install)" != no ] || return 0
+    rule=$(config_get codex_rule) arule=$(config_get antigravity_rule)
+  else
+    [ "$(config_get install)" != no ] || config_set install yes
+    [ -n "$rule" ] && config_set codex_rule "$rule"
+    [ -n "$arule" ] && config_set antigravity_rule "$arule"
+  fi
+  : "${rule:=yes}" "${arule:=yes}"
+
+  if [ "$self" != "$dest" ] && ! { [ -f "$dest" ] && [ ! -L "$dest" ] && cmp -s "$self" "$dest"; }; then
+    mkdir -p "$(dirname "$dest")"
+    _t=$(dirname "$dest")/.agentlog.$$
+    cp "$self" "$_t" && chmod 755 "$_t" && mv -f "$_t" "$dest"
+    say "installed $dest (agentlog $VERSION)"
+  else
+    say "up to date: $dest"
+  fi
+
+  if [ "$rule" = no ]; then
+    rm_rule
+  elif [ -d "$(dirname "$(dirname "$rules")")" ]; then
+    text=$(codex_rule_text "$dest")
+    if [ "$(cat "$rules" 2>/dev/null)" != "$text" ]; then
+      mkdir -p "$(dirname "$rules")"
+      printf '%s\n' "$text" >"$rules.tmp.$$" && mv -f "$rules.tmp.$$" "$rules"
+      say "codex rule: $rules (new Codex sessions run $dest outside the sandbox)"
+    else
+      say "up to date: $rules"
+    fi
+  fi
+
+  if [ "$arule" = no ]; then agy_edit remove "$dest"; else agy_edit add "$dest"; fi
+}
+
+# ---------------------------------------------------------------- hooks
+
+# Hook entry point for Claude Code, Codex and Muse (Claude's hooks.json
+# contract) on SessionStart, UserPromptSubmit and PostToolUse, and for
+# Antigravity on SessionStart and PreInvocation.
+#  - Silent unless there is something to say, and silent outside git repos.
+#  - SessionStart only introduces agentlog when the repo is actually shared:
+#    another session was active in the last 2h, or there are claims/unread.
+#  - The per-tool-call path exits after a cheap mtime check when nothing is
+#    newer than this session's read cursor.
+#
+# hook AGENT [EVENT]: Claude Code, Codex and Muse send Claude-style JSON
+# (session_id, hook_event_name, cwd) and read hookSpecificOutput back.
+# Antigravity sends conversationId and workspacePaths, runs hooks from the
+# plugin directory, names no event (hence EVENT), and reads injectSteps.
+cmd_hook() {
+  input=$(cat)
+  agent=${1:-} event=${2:-}
+  sid=$(printf '%s' "$input" | json_field session_id)
+  [ -n "$sid" ] || sid=$(printf '%s' "$input" | json_field conversationId)
+  [ -n "$event" ] || event=$(printf '%s' "$input" | json_field hook_event_name)
+  dir=$(printf '%s' "$input" | json_field cwd)
+  [ -n "$dir" ] || dir=$(printf '%s' "$input" | json_first workspacePaths)
+  if [ "$agent" = muse ] && [ -n "${MUSE_SESSION_ID:-}" ]; then
+    # Muse also runs hooks for its internal side threads (reminder checks,
+    # subagents), each with its own session_id. Only the main thread, whose
+    # thread id is the session id, takes part; the rest would consume
+    # messages the main thread never sees.
+    [ "${MUSE_THREAD_ID:-$MUSE_SESSION_ID}" = "$MUSE_SESSION_ID" ] || exit 0
+    sid=$MUSE_SESSION_ID
+  fi
+  # Antigravity runs PreInvocation before every model call; treat it like a
+  # prompt submission (presence, then the cheap "anything new?" check).
+  [ "$event" = PreInvocation ] && event=UserPromptSubmit
+  if [ -n "$dir" ] && [ -d "$dir" ]; then cd "$dir" || exit 0; fi
+  [ -n "$sid" ] && AGENTLOG_SESSION=$sid
+  [ -n "$agent" ] && AGENTLOG_AGENT=$agent
+  export AGENTLOG_SESSION AGENTLOG_AGENT
+  if [ -z "${AGENTLOG_DIR:-}" ] && ! git rev-parse --git-dir >/dev/null 2>&1; then exit 0; fi
+  detect_identity
+
+  if [ "$event" = SessionStart ] && [ -z "${AGENTLOG_NO_INSTALL:-}" ]; then
+    (cmd_install --auto) >/dev/null 2>&1 || :
+  fi
+  ensure_store
+  [ -n "$W" ] || exit 0
+
+  case $event in
+    SessionStart | UserPromptSubmit) touch_presence ;;
+  esac
+  if [ "$event" != SessionStart ]; then
+    cursor=$W/seen/$SESSION
+    [ -f "$STORE/seen/$SESSION" ] && cursor=$STORE/seen/$SESSION
+    if [ -f "$cursor" ]; then
+      fresh=$(stores | while IFS= read -r st; do
+        find "$st/msgs" -maxdepth 1 -name '*.msg' -newer "$cursor" 2>/dev/null | head -1
+      done | head -1)
+      [ -n "$fresh" ] || exit 0
+    fi
+  fi
+
+  unread=$(BRIEF=1; cmd_read -n 10)
+  al=$(self_path)
+  if [ -x "$(install_dest)" ] && cmp -s "$al" "$(install_dest)"; then al=$(install_dest); fi
+  ctx=''
+  case $event in
+    SessionStart)
+      claims=$(cmd_claims)
+      others=$(stores | while IFS= read -r st; do
+        find "$st/sessions" -maxdepth 1 -type f -mmin -120 ! -name "$SESSION" 2>/dev/null
+      done | head -1)
+      [ -n "$others$claims$unread" ] || exit 0
+      ctx="agentlog: other agents are working in this repo. You are $AGENT:$SHORT (session $SESSION).
+Use the agentlog skill. Command: $al (e.g. \`$al write -k claim -p 'src/foo/**' \"refactoring foo\"\`). Claim before larger edits, post done, reply to requests addressed to you."
+      [ -n "$claims" ] && ctx="$ctx
+
+Active claims:
+$claims"
+      [ -n "$unread" ] && ctx="$ctx
+
+Unread messages:
+$unread"
+      ;;
+    *)
+      [ -n "$unread" ] && ctx="agentlog: new messages from other agents in this repo (you are $AGENT:$SHORT; command: $al). Act on requests addressed to you; reply with \`$al write -k reply -r <id> ...\`.
+$unread"
+      ;;
+  esac
+  [ -n "$ctx" ] || exit 0
+  if [ "$agent" = antigravity ]; then
+    printf '{"injectSteps":[{"ephemeralMessage":%s}]}\n' "$(json_str "$ctx")"
+  else
+    printf '{"hookSpecificOutput":{"hookEventName":%s,"additionalContext":%s}}\n' \
+      "$(json_str "${event:-UserPromptSubmit}")" "$(json_str "$ctx")"
+  fi
+}
+
+# ---------------------------------------------------------------- main
+
+[ $# -gt 0 ] || { usage; exit 1; }
+cmd=$1; shift
+case $cmd in
+  hook) cmd_hook "$@"; exit ;;
+  install) cmd_install "$@"; exit ;;
+  -h | --help | help) usage; exit 0 ;;
+  --version | version) echo "agentlog $VERSION"; exit 0 ;;
+esac
+detect_identity
+case $cmd in
+  write | w) cmd_write "$@" ;;
+  read | r) cmd_read "$@" ;;
+  tail) cmd_tail "$@" ;;
+  claims) cmd_claims ;;
+  who) cmd_who ;;
+  show) cmd_show "$@" ;;
+  whoami) printf '%s:%s (session %s)\n' "$AGENT" "$SHORT" "$SESSION" ;;
+  gc) cmd_gc "$@" ;;
+  dir)
+    ensure_store
+    printf '%s\n' "$STORE"
+    if [ -z "$W" ]; then printf '(read-only here: nothing writable)\n'
+    elif [ "$W" != "$STORE" ]; then printf '(shared store not writable here; writing to %s)\n' "$W"; fi
+    ;;
+  *) usage >&2; exit 1 ;;
+esac

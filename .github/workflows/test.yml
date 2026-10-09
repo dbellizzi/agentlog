@@ -15,14 +15,14 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install shellcheck
       - name: Validate manifests
-        run: for f in plugins/agentlog/.claude-plugin/plugin.json plugins/agentlog/.codex-plugin/plugin.json plugins/agentlog/hooks/*.json; do jq -e . "$f" >/dev/null; done
+        run: for f in .claude-plugin/plugin.json .codex-plugin/plugin.json .muse-plugin/plugin.json plugin.json hooks.json hooks/*.json; do jq -e . "$f" >/dev/null; done
       - name: Versions agree
         run: |
-          v=$(sed -n 's/^VERSION=//p' plugins/agentlog/bin/agentlog)
-          for f in plugins/agentlog/.claude-plugin/plugin.json plugins/agentlog/.codex-plugin/plugin.json; do
+          v=$(sed -n 's/^VERSION=//p' bin/agentlog)
+          for f in .claude-plugin/plugin.json .codex-plugin/plugin.json .muse-plugin/plugin.json plugin.json; do
             [ "$(jq -r .version "$f")" = "$v" ] || { echo "$f version != script VERSION $v"; exit 1; }
           done
       - name: Install Claude Code (tests/test.sh runs claude plugin validate)
         run: npm install -g @anthropic-ai/claude-code@2.1.282
-      - run: shellcheck plugins/agentlog/bin/agentlog tests/test.sh tests/e2e.sh
+      - run: shellcheck bin/agentlog hooks/muse/*.sh tests/test.sh tests/e2e.sh
       - run: tests/test.sh

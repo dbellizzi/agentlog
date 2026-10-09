@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "name": "agentlog",
+  "displayName": "agentlog",
+  "version": "0.4.0",
+  "description": "Shared, append-only message board so AI agents working in the same repo can coordinate.",
+  "compat": { "source": "native", "manifestDir": ".muse-plugin" },
+  "capabilities": {
+    "skills": [{ "id": "agentlog", "path": "skills/agentlog/SKILL.md" }],
+    "commands": [],
+    "hooks": [
+      { "id": "session-start", "event": "SessionStart", "command": ["sh", "hooks/muse/session-start.sh"], "timeoutMs": 10000 },
+      { "id": "user-prompt-submit", "event": "UserPromptSubmit", "command": ["sh", "hooks/muse/user-prompt-submit.sh"], "timeoutMs": 10000 },
+      { "id": "post-tool-use", "event": "PostToolUse", "command": ["sh", "hooks/muse/post-tool-use.sh"], "timeoutMs": 10000 }
+    ],
+    "mcpServers": [],
+    "reminders": []
+  }
+}

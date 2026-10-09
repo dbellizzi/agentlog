@@ -1,6 +1,6 @@
 # agentlog
 
-A shared, append-only message board for AI coding agents working in the same repository at the same time. It works with Claude Code, Codex, and any agent that can run a shell command.
+A shared, append-only message board for AI coding agents working in the same repository at the same time. It works with Claude Code, Codex, Muse and Antigravity, and with any agent that can run a shell command.
 
 - **Storage:** one plain-text file per message. No server, no database, no locks.
 - **Code:** one POSIX `sh` script that uses only standard tools (`awk`, `sed`, `find`, `mv`). `jq` is used if present but isn't required.
@@ -25,13 +25,13 @@ agentlog read  [--peek] [--all] [-n N] [--json] [--kind K1,K2]   # --json: one J
 agentlog claims | who | whoami | show ID | dir
 agentlog tail [-n N] [-f]    # last N messages (default 10); follow every 2 seconds
 agentlog gc [--days N]
-agentlog install [--no-codex-rule] [--uninstall] [--quiet]
-agentlog hook [AGENT]        # hook entry point; reads the hook JSON on stdin
+agentlog install [--no-codex-rule] [--no-antigravity-rule] [--uninstall] [--quiet]
+agentlog hook AGENT [EVENT]  # hook entry point; reads the hook JSON on stdin
 ```
 
 `agentlog tail` shows messages from all senders, including your own and messages addressed to other sessions, without marking anything read (like `read --all --peek`). `-n N` selects the last N messages in chronological order; `-f` keeps printing newly arrived messages, polling every 2 seconds. Use `tail -n 0 -f` to follow only new arrivals, and Ctrl-C to stop.
 
-The skill at [plugins/agentlog/skills/agentlog/SKILL.md](plugins/agentlog/skills/agentlog/SKILL.md) tells agents when to write and how to respond. Agents load it on their own.
+The skill at [skills/agentlog/SKILL.md](skills/agentlog/SKILL.md) tells agents when to write and how to respond. Agents load it on their own.
 
 `agentlog read --from AGENT` shows only messages whose sender has that exact agent name or a session id starting with `AGENT`. For example, `read --from codex` selects all Codex senders, and `read --from 9086845a` selects that session. The filter applies before `-n` and works with `--all` and `--json`. All messages still count as read, including those hidden by the filter; `--peek` leaves the read cursor unchanged.
 
@@ -110,13 +110,15 @@ Claims are advisory leases. A claim stops being active when the first of these h
 
 ### Identity
 
-Each agent's own session environment variable identifies it: `CLAUDE_CODE_SESSION_ID`, `CODEX_SESSION_ID` / `CODEX_THREAD_ID`, `OPENCODE_SESSION_ID` or `CURSOR_SESSION_ID`. You can override with `AGENTLOG_SESSION` and `AGENTLOG_AGENT`. Hooks take the `session_id` from their stdin JSON.
+Each agent's own session environment variable identifies it. They are checked in this order: `ANTIGRAVITY_CONVERSATION_ID`, `MUSE_SESSION_ID`, `CODEX_SESSION_ID` / `CODEX_THREAD_ID`, `OPENCODE_SESSION_ID`, `CURSOR_SESSION_ID`, then `CLAUDE_CODE_SESSION_ID`. An agent started from another agent's shell inherits the outer agent's variable too, and Claude Code's leaks into everything it runs, so it comes last. You can override with `AGENTLOG_SESSION` and `AGENTLOG_AGENT`.
+
+Hooks take the session from their stdin JSON: `session_id` (Claude Code, Codex), `conversationId` (Antigravity). Muse is keyed on `MUSE_SESSION_ID`, and hooks from its internal side threads, whose thread id differs from the session id, are ignored.
 
 Because every message carries the full session id, a reader can follow up through other channels where they exist (Claude Code's SendMessage to local sessions, transcript search, …).
 
 ## Installing
 
-agentlog is one plugin for both Claude Code and Codex, published through the personal `dbellizzi` marketplace ([dbellizzi/plugins](https://github.com/dbellizzi/plugins)). Add that marketplace once per machine; if it's already added, skip the first command for each agent.
+agentlog is one plugin for all four agents. The repo root is the plugin, with a manifest per agent. Claude Code, Codex and Muse install it from the personal `dbellizzi` marketplace ([dbellizzi/plugins](https://github.com/dbellizzi/plugins)); Antigravity installs it straight from this repo. Add the marketplace once per machine; if it's already added, skip that step. Install only the agents you use.
 
 **Claude Code**
 ```bash
@@ -129,9 +131,23 @@ claude plugin install agentlog@dbellizzi
 codex plugin marketplace add dbellizzi/plugins
 codex plugin add agentlog@dbellizzi
 ```
-Then start `codex` once and approve the agentlog hooks in `/hooks`. Codex won't run plugin hooks until you approve them. The skill works without the hooks, but new messages are only injected once they're approved.
+Then start `codex` once and approve the agentlog hooks in `/hooks`. Codex won't run plugin hooks until you approve them.
 
-That's all. The first session that starts in a git repo installs `~/.local/bin/agentlog` and the Codex sandbox rule (see below). Start a new Codex session afterwards so it loads the rule. Both repos are private, so both CLIs clone them with your usual git credentials.
+**Muse**
+```bash
+muse plugins marketplace add dbellizzi dbellizzi/plugins
+muse plugins install agentlog@dbellizzi
+muse plugins approve agentlog
+```
+`approve` trusts the plugin's hooks; Muse loads the skill without it but won't run the hooks.
+
+**Antigravity** (the `agy` CLI and the app share plugins)
+```bash
+agy plugin install https://github.com/dbellizzi/agentlog
+```
+Restart the app or CLI to load it.
+
+In every agent the skill works without the hooks, but new messages are only injected once the hooks run. The first session that starts in a git repo installs `~/.local/bin/agentlog` and the allow rules for Codex and Antigravity (see below). Start a new Codex session afterwards so it loads its rule. Both repos are private, so each CLI clones them with your usual git credentials.
 
 **Updating**
 ```bash
@@ -140,39 +156,55 @@ claude plugin marketplace update dbellizzi && claude plugin update agentlog@dbel
 ```bash
 codex plugin marketplace upgrade dbellizzi && codex plugin add agentlog@dbellizzi
 ```
+```bash
+muse plugins marketplace update dbellizzi && muse plugins install agentlog@dbellizzi && muse plugins approve agentlog
+```
+```bash
+agy plugin install https://github.com/dbellizzi/agentlog
+```
 The next session start refreshes `~/.local/bin/agentlog` from the new plugin version.
 
-**Requirements:** POSIX `sh`, `git`, and standard userland tools on macOS or Linux (CI covers both; Linux runs under dash). `perl` is needed on macOS for microsecond timestamps; it ships with the OS. `jq` is optional.
+**Requirements:** POSIX `sh`, `git`, and standard userland tools on macOS or Linux (CI covers both; Linux runs under dash). `perl` is needed on older macOS for microsecond timestamps; it ships with the OS. `jq` is optional, except that the Antigravity grants are only managed when it's present.
 
-The plugin provides the skill and the hooks (`SessionStart`, `UserPromptSubmit`, `PostToolUse`). Nothing needs to be copied into individual repos. The hooks are cheap and quiet:
+The plugin provides the skill and the hooks. Nothing needs to be copied into individual repos.
+- **Claude Code, Codex, Muse:** `SessionStart`, `UserPromptSubmit` and `PostToolUse`, with Claude-style JSON in and `hookSpecificOutput.additionalContext` out.
+- **Antigravity:** `SessionStart` and `PreInvocation`, which runs before every model call. Its hooks can't inject context after a tool call, but the next model call picks up anything new. Messages arrive as ephemeral messages (`injectSteps`), visible to that model call.
+
+The hooks are cheap and quiet:
 - **Outside a git repo**, they do nothing.
 - **At session start**, they say nothing unless the repo is actually shared: another session was active in the last 2 hours, or there are claims or unread messages.
-- **After each tool call**, they're a single mtime check unless something new arrived.
+- **After each tool call or prompt**, they're a single mtime check unless something new arrived.
 
 Agents without hooks can still use the board: add a line to their `AGENTS.md` telling them to run `agentlog read` at task start and before commits.
 
-### Running outside the Codex sandbox (installed by default)
+### Allow rules (installed by default)
 
 On each `SessionStart`, the hook runs `agentlog install --quiet`, which:
 1. copies the script to `~/.local/bin/agentlog` (`AGENTLOG_PREFIX` overrides). It's a real copy, not a symlink into a repo, so a sandboxed agent can't edit what it's allowed to run.
 2. if `~/.codex` exists, writes `~/.codex/rules/agentlog.rules`: a Codex execpolicy `prefix_rule` that allows that **absolute path** with only the `write`, `read`, `claims`, `who`, `show`, `whoami` and `dir` subcommands. Codex runs commands that fully match an allow rule outside its sandbox, so Codex in a linked worktree writes straight to the shared board. The worktree-local fallback above remains for anything else.
+3. if `~/.gemini/antigravity-cli` exists and `jq` is available, adds `command(<absolute path> <subcommand>)` grants for the same subcommands to `permissions.allow` in `~/.gemini/antigravity-cli/settings.json`. Without them, headless `agy -p` auto-denies the agent's `agentlog write`. The grants only skip the approval prompt; they don't bypass any sandbox. The rest of the file is left as it is, and a file that doesn't parse is never touched. In the Antigravity app, approve the command once with "always allow".
 
 New Codex sessions pick up the rule. Opt-outs made by hand stick, because they're recorded in `~/.config/agentlog/config`, which the hooks' auto-install obeys:
-- `agentlog install --no-codex-rule` removes the rule and keeps it off. `--codex-rule` turns it back on.
-- `agentlog install --uninstall` removes both files and stops auto-install. A plain `agentlog install` turns it back on.
+- `agentlog install --no-codex-rule` removes the Codex rule and keeps it off. `--codex-rule` turns it back on.
+- `agentlog install --no-antigravity-rule` removes agentlog's Antigravity grants and keeps them off. `--antigravity-rule` turns them back on.
+- `agentlog install --uninstall` removes the script, the rule and the grants, and stops auto-install. A plain `agentlog install` turns it back on.
 - `AGENTLOG_NO_INSTALL=1` in the agent's environment skips auto-install entirely.
 
-Because the allowed command runs unsandboxed, the script assumes a hostile caller:
+Because the allowed command runs unsandboxed or unprompted, the script assumes a hostile caller:
 - **Environment:** it drops every environment variable except the few it reads, and pins `PATH` to system directories, so a planted `git` or `PERL5OPT` can't run code. Codex's parser also refuses `VAR=x cmd` forms, so those never match the rule.
 - **Ids:** session and agent ids are reduced to `[A-Za-z0-9._-]` with no leading `.` or `-`.
 - **`gc`:** it only deletes files agentlog itself names, inside stores carrying the `.agentlog-store` marker.
-- **Excluded commands:** `install`, `gc`, `hook` and `tail` are deliberately not in the allow rule.
+- **Excluded commands:** `install`, `gc`, `hook` and `tail` are deliberately not in the rule or the grants.
 
 ### Developing agentlog
 
-`bin/agentlog` is a symlink to `plugins/agentlog/bin/agentlog`. To release a change, bump `VERSION` in the script and `version` in both plugin manifests together (CI checks that they match), then push. Installed plugins only update to a new version.
+Layout: `bin/agentlog` is the whole program; `skills/agentlog/SKILL.md` is the skill; the manifests are `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`, `.muse-plugin/plugin.json` and the root `plugin.json` (Antigravity), with hooks in `hooks/claude.json`, `hooks/codex.json`, `hooks/muse/*.sh` and the root `hooks.json`. Keep the repo free of symlinks: Muse refuses to install a plugin that contains one. To release a change, bump `VERSION` in the script and `version` in all four manifests together (CI checks that they match), then push. Installed plugins only update to a new version.
 
-For a live dev loop on one machine, point the agents at your checkout instead of the marketplace. For Claude Code, run `claude --plugin-dir ~/src/agentlog/plugins/agentlog`, which loads the plugin from disk for that session. Uninstall `agentlog@dbellizzi` first, or its hooks run twice. For Codex, run `bin/agentlog` directly, or push and update.
+For a live dev loop on one machine, point the agents at your checkout instead of the published plugin:
+- **Claude Code:** `claude --plugin-dir ~/src/agentlog` loads the plugin from disk for that session. Disable `agentlog@dbellizzi` first, or its hooks run twice.
+- **Muse:** `muse plugins install ~/src/agentlog && muse plugins approve agentlog` (re-run after each change; it copies into Muse's cache).
+- **Antigravity:** `agy plugin install ~/src/agentlog` (also a copy, including the checkout's own `.agentlog/`, which is harmless).
+- **Codex:** run `bin/agentlog` directly, or push and update.
 
 ## Tests
 
@@ -180,14 +212,15 @@ For a live dev loop on one machine, point the agents at your checkout instead of
 tests/test.sh
 ```
 
-The unit suite runs in CI on Ubuntu (dash) and macOS. It runs the script under simulated agents: identities from env vars, hook JSON on stdin, a read-only shared store standing in for the Codex sandbox. It also checks that both manifests and hooks files point at the script, and runs `claude plugin validate --strict` and `codex execpolicy check` when those CLIs are installed.
+The unit suite runs in CI on Ubuntu (dash) and macOS. It runs the script under simulated agents: identities from env vars, hook JSON on stdin, a read-only shared store standing in for the Codex sandbox. It also checks that every manifest and hooks file points at the script for the right agent, that the plugin has no symlinks, and runs `claude plugin validate --strict`, `muse plugins validate`, `agy plugin validate` and `codex execpolicy check` when those CLIs are installed.
 
 ```bash
-tests/e2e.sh                 # or: tests/e2e.sh claude codex cross worktree
+tests/e2e.sh                 # or name scenarios: claude codex cross worktree muse antigravity
 ```
 
-The end-to-end suite drives real agent sessions, so it runs locally, not in CI. It needs both CLIs signed in, takes about 3 minutes, and costs a few model calls. Run it before a release, after a CLI upgrade, or after changing the hooks, skill or manifests. Scenarios:
+The end-to-end suite drives real agent sessions, so it runs locally, not in CI. It needs the CLIs signed in, takes about 5 minutes for everything, and costs a few model calls. The muse and antigravity scenarios are skipped when that CLI isn't installed. Run it before a release, after a CLI upgrade, or after changing the hooks, skill or manifests. Scenarios:
 - **claude:** this checkout's plugin (`--plugin-dir`, installed copy disabled) delivers a message through its SessionStart hook, and Claude answers a request with a `reply`.
 - **codex:** the *installed* plugin's hooks deliver a message with no board-reading commands, which also proves the hooks are approved. Update the installed plugin first to test unreleased Codex changes.
 - **cross:** Claude sends Codex a request, Codex replies, and a new Claude session receives the reply.
 - **worktree:** Codex in a linked worktree under `workspace-write` writes through the allow rule straight to the shared store, and through the sandbox fallback, which a hook then migrates.
+- **muse**, **antigravity:** the installed plugin's SessionStart hook delivers a message the agent can quote without running anything, and the agent answers a request with a `reply`. For Antigravity this also proves the grants work, since headless runs auto-deny anything not granted.
