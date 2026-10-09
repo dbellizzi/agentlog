@@ -41,6 +41,17 @@ mkdir -p "$cache" || die "cannot create $cache"
 work=$(mktemp -d "$cache/agentlog-e2e.XXXXXX") || die "mktemp failed"
 pass=0 fail=0
 
+# codex exec records every directory it runs in as a trusted project in its
+# config.toml. Drop the ones under $work so test runs don't pile up there.
+untrust_scratch() {
+  cfg=${CODEX_HOME:-$HOME/.codex}/config.toml
+  [ -f "$cfg" ] && grep -qF "[projects.\"$work/" "$cfg" || return 0
+  awk -v p="[projects.\"$work/" 'index($0, p) == 1 { skip = 1; next } /^\[/ { skip = 0 } !skip' \
+    "$cfg" >"$cfg.e2e.$$" && cat "$cfg.e2e.$$" >"$cfg"
+  rm -f "$cfg.e2e.$$"
+}
+trap untrust_scratch EXIT
+
 ok() { pass=$((pass + 1)); echo "ok   $1"; }
 bad() { fail=$((fail + 1)); echo "FAIL $1"; [ $# -lt 2 ] || echo "     see $2"; }
 check() { # check NAME LOG CMD...
