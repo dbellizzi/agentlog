@@ -80,7 +80,7 @@ rewriting token refresh
 | `Kind` | `note` · `claim` · `release` · `request` · `reply` · `done` |
 | `To` | `*` (everyone), an agent name (`codex`), or a session-id prefix |
 | `Re` | id of the message this answers or closes |
-| `Paths` | space-separated paths/globs (required for `claim`) |
+| `Paths` | space-separated paths/globs, or `file:sym1+sym2` for symbols within a file (required for `claim`) |
 | `Expires` | Unix epoch seconds. Claims default to 2h. |
 
 Ids sort by time: a UTC timestamp with microseconds, then the sender's session prefix and a random suffix.

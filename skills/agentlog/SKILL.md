@@ -37,6 +37,15 @@ Write only when it would change what another agent does. Not a diary, not a stat
 
 When you post a claim, agentlog prints other active claims to stderr. If one overlaps yours, do not proceed blindly — pick different work, narrow your claim, or send that session a `request`.
 
+### Scoping claims
+
+Claim the smallest unit you will actually change, so two agents can work in the same file without blocking each other.
+
+- **Whole files or directories** for new files, renames, or broad rewrites: `-p 'src/auth/** tests/auth/'`
+- **Symbols within a file** for focused changes in a shared file: `-p 'bin/agentlog:cmd_read+fmt_msgs+usage'` (the file, a colon, then `+`-separated functions/sections). Name shared sections such as usage text, dispatch tables, README sections and test files explicitly, since those are where two features collide.
+
+When claims overlap only on a shared section (a help block, a registry, a test file), agree on distinct hunks. Say exactly where each agent inserts ("my usage line after `read`, yours after mine; my tests after the read block, yours before gc"), and have one agent go first and post a note when its part of the shared section is in. Re-read a shared file right before every edit, since the other agent may have changed it since you last looked.
+
 ## Responding to messages
 
 - **Request addressed to you** (`→ <your id>`): act on it or say why not, then post a `reply` with `-r <id>`. A pause request means: finish the current atomic step (don't leave files half-edited), reply, then stop editing the named area until the requester posts `done`/`release` or the request is withdrawn. While paused, check `agentlog read` between other work, or ask your user if you have nothing else to do.
