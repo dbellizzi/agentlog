@@ -1,4 +1,5 @@
 #!/bin/sh
+# shellcheck disable=SC2016 # single-quoted awk/sed programs are intentional
 # agentlog — a shared, append-only message board for coding agents working in
 # the same repository. One file per message, written to tmp/ and renamed into
 # msgs/, so concurrent writers never interleave and no locking is needed.
@@ -13,9 +14,16 @@ need() { [ $# -ge 2 ] || die "option $1 needs a value"; }
 
 # ---------------------------------------------------------------- store
 
-# The store lives next to the main worktree's .git (not inside it — Codex's
-# sandbox mounts .git read-only), so every worktree of a repo shares it.
+# The shared store lives next to the main worktree's .git (not inside it —
+# Codex's sandbox mounts .git read-only), so every worktree of a repo shares it.
+#
+# Sandboxed agents in a linked worktree often cannot write outside that
+# worktree. They write to a local store at <worktree>/.agentlog instead
+# (covered by the same /.agentlog/ exclude), readers union every store, and
+# any unsandboxed run (hooks usually are) migrates local messages into the
+# shared store.
 resolve_store() {
+  LOCAL=''
   if [ -n "${AGENTLOG_DIR:-}" ]; then STORE=$AGENTLOG_DIR; return; fi
   common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) ||
     die "not inside a git repository (set AGENTLOG_DIR to use a plain directory)"
@@ -23,20 +31,76 @@ resolve_store() {
     */.git) STORE=${common%/.git}/.agentlog ;;
     *) STORE=$common/agentlog ;; # bare repo
   esac
+  LOCAL=$(worktree)/.agentlog
+  [ "$LOCAL" = "$STORE" ] && LOCAL=''
   exclude=$common/info/exclude
   if ! grep -qsx '/.agentlog/' "$exclude" 2>/dev/null; then
     { mkdir -p "$common/info" && printf '/.agentlog/\n' >>"$exclude"; } 2>/dev/null || :
   fi
 }
 
-ensure_store() {
-  resolve_store
-  mkdir -p "$STORE/msgs" "$STORE/tmp" "$STORE/seen" "$STORE/sessions"
+mkstore() {
+  mkdir -p "$1/msgs" "$1/tmp" "$1/seen" "$1/sessions" 2>/dev/null &&
+    (: >"$1/tmp/.probe.$$") 2>/dev/null && rm -f "$1/tmp/.probe.$$"
 }
 
-# Atomic replace: write to a temp file in the store, then rename over $1.
+# Sets W, the store this process writes to, or "" when nothing is writable
+# (a read-only sandbox): reads still work but do not advance the cursor.
+# TMP holds scratch files and is always writable.
+ensure_store() {
+  resolve_store
+  W=''
+  if mkstore "$STORE"; then
+    W=$STORE
+    migrate_local
+  elif [ -n "$LOCAL" ] && mkstore "$LOCAL"; then
+    W=$LOCAL
+  fi
+  TMP=$(mktemp -d "${TMPDIR:-/tmp}/agentlog.XXXXXX")
+  trap 'rm -rf "$TMP"' 0
+}
+
+need_writable() { [ -n "$W" ] || die "cannot write to $STORE${LOCAL:+ or $LOCAL}"; }
+
+# Every store that may hold messages: the shared one, then each worktree's.
+stores() {
+  printf '%s\n' "$STORE"
+  [ -n "${AGENTLOG_DIR:-}" ] && return
+  git worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' |
+    while IFS= read -r wt; do
+      [ -d "$wt/.agentlog" ] && [ "$wt/.agentlog" != "$STORE" ] && printf '%s\n' "$wt/.agentlog"
+    done
+  return 0
+}
+
+# Move messages, read cursors and presence from worktree stores into the
+# shared one. Copy-then-rename keeps each message atomic even across
+# filesystems; a message briefly in both places is deduplicated by id.
+migrate_local() {
+  stores | sed 1d | while IFS= read -r ls; do
+    for f in "$ls"/msgs/*.msg; do
+      [ -f "$f" ] || continue
+      _t=$STORE/msgs/.w.$$.$(rand)
+      cp "$f" "$_t" && mv -f "$_t" "$STORE/msgs/${f##*/}" && rm -f "$f"
+    done
+    for f in "$ls"/seen/*; do
+      [ -f "$f" ] || continue
+      _d=$STORE/seen/${f##*/}
+      touch "$_d"
+      sort -u "$_d" "$f" | atomic_write "$_d" && rm -f "$f"
+    done
+    for f in "$ls"/sessions/*; do
+      [ -f "$f" ] || continue
+      _d=$STORE/sessions/${f##*/}
+      if [ ! -f "$_d" ] || [ "$f" -nt "$_d" ]; then atomic_write "$_d" <"$f"; fi
+      rm -f "$f"
+    done
+  done
+}
+
+# Atomic replace: write a hidden temp file beside $1, then rename over it.
 atomic_write() {
-  _t=$STORE/tmp/.w.$$.$(rand)
+  _t=$(dirname "$1")/.w.$$.$(rand)
   cat >"$_t"
   mv -f "$_t" "$1"
 }
@@ -86,22 +150,25 @@ worktree() { git rev-parse --show-toplevel 2>/dev/null || pwd; }
 branch() { git symbolic-ref --short -q HEAD 2>/dev/null || git rev-parse --short HEAD 2>/dev/null || echo -; }
 
 touch_presence() {
+  [ -n "$W" ] || return 0
   {
     printf 'agent=%s\nsession=%s\nbranch=%s\nworktree=%s\nseen=%s\n' \
       "$AGENT" "$SESSION" "$(branch)" "$(worktree)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  } | atomic_write "$STORE/sessions/$SESSION"
+  } | atomic_write "$W/sessions/$SESSION"
 }
 
 # ---------------------------------------------------------------- index
 
-# One TSV line per message, sorted oldest first:
-# name kind agent session to re expires paths branch date
+# One TSV line per message across all stores, sorted oldest first:
+# name kind agent session to re expires paths branch date path
 index() {
-  find "$STORE/msgs" -name '*.msg' -type f -exec awk '
+  stores | while IFS= read -r st; do
+    [ -d "$st/msgs" ] && find "$st/msgs" -name '*.msg' -type f
+  done | tr '\n' '\0' | xargs -0 awk '
     FNR == 1 { inh = 1; k = a = s = t = r = e = p = b = d = "" }
     inh && /^$/ {
       n = FILENAME; sub(/.*\//, "", n); sub(/\.msg$/, "", n)
-      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", n, k, a, s, t, r, e, p, b, d
+      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", n, k, a, s, t, r, e, p, b, d, FILENAME
       inh = 0; next
     }
     !inh { next }
@@ -109,7 +176,7 @@ index() {
     key == "Kind" { k = val } key == "Agent" { a = val } key == "Session" { s = val }
     key == "To" { t = val } key == "Re" { r = val } key == "Expires" { e = val }
     key == "Paths" { p = val } key == "Branch" { b = val } key == "Date" { d = val }
-  ' {} + | sort
+  ' /dev/null | sort | awk -F '\t' '!seen[$1]++' # /dev/null: never read stdin
 }
 
 # Active claims (TSV, same columns). A claim ends when it expires, when its
@@ -206,6 +273,7 @@ cmd_write() {
   [ -n "$ttl" ] && expires=$(($(now_epoch) + $(parse_ttl "$ttl")))
 
   ensure_store
+  need_writable
   id=$(stamp)-$SHORT-$(rand)
   {
     printf 'Id: %s\nDate: %s\nAgent: %s\nSession: %s\nBranch: %s\nWorktree: %s\nKind: %s\nTo: %s\n' \
@@ -215,7 +283,7 @@ cmd_write() {
     [ -n "$paths" ] && printf 'Paths: %s\n' "$(oneline "$paths")"
     [ -n "$expires" ] && printf 'Expires: %s\n' "$expires"
     printf '\n%s\n' "$body"
-  } | atomic_write "$STORE/msgs/$id.msg"
+  } | atomic_write "$W/msgs/$id.msg"
   touch_presence
   printf '%s\n' "$id"
 
@@ -305,9 +373,9 @@ cmd_read() {
     esac
   done
   ensure_store
-  seen=$STORE/seen/$SESSION
-  [ -f "$seen" ] || : >"$seen"
-  work=$STORE/tmp/.r.$$.$(rand)
+  work=$TMP/r
+  seen=$work.seen
+  cat "$STORE/seen/$SESSION" ${LOCAL:+"$LOCAL/seen/$SESSION"} 2>/dev/null | sort -u >"$seen" || :
   if [ $all -eq 1 ]; then
     index >"$work.new"
     cp "$work.new" "$work.del"
@@ -327,12 +395,11 @@ cmd_read() {
     if [ "$fmt" = fmt_json ]; then printf '%s\n' "$notice" >&2; else printf '%s\n' "$notice"; fi
     tail -n "$limit" "$work.del" >"$work.lim"; mv "$work.lim" "$work.del"
   fi
-  [ -s "$work.del" ] && cut -f1 "$work.del" | sed "s|.*|$STORE/msgs/&.msg|" | "$fmt"
+  [ -s "$work.del" ] && cut -f11 "$work.del" | "$fmt"
 
-  if [ $peek -eq 0 ] && [ -s "$work.new" ]; then
-    cut -f1 "$work.new" | sort -u "$seen" - | atomic_write "$seen"
+  if [ $peek -eq 0 ] && [ -n "$W" ] && [ -s "$work.new" ]; then
+    cut -f1 "$work.new" | sort -u "$seen" - | atomic_write "$W/seen/$SESSION"
   fi
-  rm -f "$work.new" "$work.del"
   touch_presence
 }
 
@@ -351,8 +418,7 @@ cmd_tail() {
     '' | *[!0-9]*) die "tail: -n needs a non-negative integer" ;;
   esac
   ensure_store
-  work=$STORE/tmp/.tail.$$.$(rand)
-  trap 'rm -f "$work.index" "$work.ids" "$work.del"' 0
+  work=$TMP/tail
   trap 'exit 130' INT
   trap 'exit 143' TERM
   index >"$work.index"
@@ -361,7 +427,7 @@ cmd_tail() {
   touch_presence
   while :; do
     if [ -s "$work.del" ]; then
-      cut -f1 "$work.del" | sed "s|.*|$STORE/msgs/&.msg|" | fmt_msgs
+      cut -f11 "$work.del" | fmt_msgs
     fi
     [ "$follow" -eq 1 ] || break
     sleep 2
@@ -380,22 +446,24 @@ cmd_claims() {
 
 cmd_who() {
   ensure_store
-  find "$STORE/sessions" -type f -mtime -1 -exec awk -F= -v me="$SESSION" '
+  stores | while IFS= read -r st; do
+    [ -d "$st/sessions" ] && find "$st/sessions" -type f -mtime -1
+  done | tr '\n' '\0' | xargs -0 awk -F= -v me="$SESSION" '
     FNR == 1 && NR > 1 { out() }
     { v[$1] = substr($0, length($1) + 2) }
     END { if (NR) out() }
     function out() {
       mark = (v["session"] == me) ? " (you)" : ""
-      printf "  %s  %s:%s%s  @%s  %s\n", v["seen"], v["agent"], substr(v["session"], 1, 8), mark, v["branch"], v["worktree"]
+      printf "%s\t%s\t  %s  %s:%s%s  @%s  %s\n", v["seen"], v["session"], v["seen"], v["agent"], substr(v["session"], 1, 8), mark, v["branch"], v["worktree"]
       delete v
-    }' {} + | sort -r
+    }' /dev/null | sort -r | awk -F '\t' '!u[$2]++' | cut -f3-
 }
 
 cmd_show() {
   [ $# -eq 1 ] || die "show: need a message id"
   ensure_store
-  f=$STORE/msgs/$1.msg
-  [ -f "$f" ] || die "show: no message $1"
+  f=$(index | awk -F '\t' -v id="$1" '$1 == id { print $11 }')
+  [ -n "$f" ] || die "show: no message $1"
   cat "$f"
 }
 
@@ -403,14 +471,17 @@ cmd_gc() {
   days=7
   [ "${1:-}" = --days ] && { need "$@"; days=$2; }
   ensure_store
-  find "$STORE/msgs" "$STORE/sessions" -type f -mtime +"$days" -exec rm -f {} +
-  find "$STORE/tmp" -type f -mmin +60 -exec rm -f {} +
-  find "$STORE/msgs" -name '*.msg' -type f | sed 's|.*/||; s/\.msg$//' | sort >"$STORE/tmp/.gc.$$"
-  for s in "$STORE"/seen/*; do
-    [ -f "$s" ] || continue
-    comm -12 "$s" "$STORE/tmp/.gc.$$" | atomic_write "$s"
+  stores | while IFS= read -r st; do
+    find "$st/msgs" "$st/sessions" -type f -mtime +"$days" -exec rm -f {} + 2>/dev/null || :
+    find "$st/tmp" "$st/msgs" "$st/seen" "$st/sessions" -name '.w.*' -mmin +60 -exec rm -f {} + 2>/dev/null || :
+    find "$st/tmp" -type f -mmin +60 -exec rm -f {} + 2>/dev/null || :
   done
-  rm -f "$STORE/tmp/.gc.$$"
+  [ -n "$W" ] || return 0
+  index | cut -f1 >"$TMP/ids"
+  for f in "$W"/seen/*; do
+    [ -f "$f" ] || continue
+    sort "$f" | comm -12 - "$TMP/ids" | atomic_write "$f"
+  done
 }
 
 # ---------------------------------------------------------------- hooks
@@ -494,6 +565,11 @@ case $cmd in
   show) cmd_show "$@" ;;
   whoami) printf '%s:%s (session %s)\n' "$AGENT" "$SHORT" "$SESSION" ;;
   gc) cmd_gc "$@" ;;
-  dir) resolve_store; printf '%s\n' "$STORE" ;;
+  dir)
+    ensure_store
+    printf '%s\n' "$STORE"
+    if [ -z "$W" ]; then printf '(read-only here: nothing writable)\n'
+    elif [ "$W" != "$STORE" ]; then printf '(shared store not writable here; writing to %s)\n' "$W"; fi
+    ;;
   *) usage >&2; exit 1 ;;
 esac

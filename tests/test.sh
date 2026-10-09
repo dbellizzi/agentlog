@@ -131,4 +131,34 @@ run a aaaa1111 gc --days 7
 check "gc: old message removed, new kept" "[ \$(ls \"$AGENTLOG_DIR/msgs\" | wc -l) -eq 1 ]"
 check "gc: seen list pruned" "[ ! -s \"$AGENTLOG_DIR/seen/bbbb2222\" ]"
 
+# --- worktrees: one shared store; sandboxed writers fall back to a local store
+fresh wt
+unset AGENTLOG_DIR
+mkdir -p "$root/wt/repo"
+repo=$(cd "$root/wt/repo" && pwd -P)
+git -C "$repo" init -q -b main && git -C "$repo" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+git -C "$repo" worktree add -q -b side "$root/wt/side"
+side=$(cd "$root/wt/side" && pwd -P)
+shared=$repo/.agentlog
+check "worktree: resolves to the main checkout's store" "[ \"\$(cd \"$side\" && \"$AL\" dir)\" = \"$shared\" ]"
+(cd "$side" && run codex bbbb2222 write "from side, unsandboxed") >/dev/null
+check "worktree: unsandboxed write lands in shared store" "[ \$(ls \"$shared/msgs\" | wc -l) -eq 1 ]"
+check "worktree: exclude covers every worktree" "[ -z \"\$(git -C \"$side\" status --porcelain)\" ] && [ -z \"\$(git -C \"$repo\" status --porcelain)\" ]"
+
+chmod -R a-w "$shared" # simulate a sandbox that can only write inside the worktree
+sid=$(cd "$side" && run codex bbbb2222 write -k claim -p 'src/' "sandboxed claim")
+check "worktree: sandboxed write falls back to local store" "[ -f \"$side/.agentlog/msgs/$sid.msg\" ]"
+check "worktree: dir reports the fallback" "(cd \"$side\" && \"$AL\" dir) | grep -q 'writing to $side/.agentlog'"
+out=$(cd "$repo" && run claude-code aaaa1111 read --peek)
+check "worktree: main checkout reads local-store messages" "printf '%s' \"\$out\" | grep -q 'sandboxed claim'"
+check "worktree: read-only reader does not advance cursor" "[ -n \"\$(cd \"$repo\" && run claude-code aaaa1111 read)\" ]"
+check "worktree: claims union both stores" "(cd \"$repo\" && run claude-code aaaa1111 claims) | grep -q 'src/'"
+(cd "$side" && run codex bbbb2222 read) >/dev/null
+chmod -R u+w "$shared"
+
+out=$(cd "$repo" && run claude-code aaaa1111 read)
+check "worktree: unsandboxed run migrates local messages" "[ -f \"$shared/msgs/$sid.msg\" ] && [ -z \"\$(ls \"$side/.agentlog/msgs\")\" ]"
+check "worktree: migrated message delivered once" "[ \$(printf '%s\n' \"\$out\" | grep -c 'sandboxed claim') -eq 1 ] && [ -z \"\$(cd \"$repo\" && run claude-code aaaa1111 read)\" ]"
+check "worktree: local read cursor migrated" "[ -f \"$shared/seen/bbbb2222\" ] && [ ! -f \"$side/.agentlog/seen/bbbb2222\" ]"
+
 [ $fails -eq 0 ] && echo "all passed" || { echo "$fails failed"; exit 1; }
