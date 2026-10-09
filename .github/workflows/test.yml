@@ -15,7 +15,7 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install shellcheck
       - name: Validate manifests
-        run: for f in .claude-plugin/marketplace.json .agents/plugins/marketplace.json plugins/agentlog/.claude-plugin/plugin.json plugins/agentlog/.codex-plugin/plugin.json plugins/agentlog/hooks/*.json; do jq -e . "$f" >/dev/null; done
+        run: for f in plugins/agentlog/.claude-plugin/plugin.json plugins/agentlog/.codex-plugin/plugin.json plugins/agentlog/hooks/*.json; do jq -e . "$f" >/dev/null; done
       - name: Versions agree
         run: |
           v=$(sed -n 's/^VERSION=//p' plugins/agentlog/bin/agentlog)

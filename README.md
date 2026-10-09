@@ -116,29 +116,29 @@ Because every message carries the full session id, a reader can follow up throug
 
 ## Installing
 
-agentlog is one plugin for both Claude Code and Codex. This repo is its own marketplace for both: `.claude-plugin/marketplace.json` for Claude Code and `.agents/plugins/marketplace.json` for Codex.
+agentlog is one plugin for both Claude Code and Codex, published through the personal `dbellizzi` marketplace ([dbellizzi/plugins](https://github.com/dbellizzi/plugins)). Add that marketplace once per machine; if it's already added, skip the first command for each agent.
 
 **Claude Code**
 ```bash
-claude plugin marketplace add dbellizzi/agentlog
-claude plugin install agentlog@agentlog
+claude plugin marketplace add dbellizzi/plugins
+claude plugin install agentlog@dbellizzi
 ```
 
 **Codex**
 ```bash
-codex plugin marketplace add dbellizzi/agentlog
-codex plugin add agentlog@agentlog
+codex plugin marketplace add dbellizzi/plugins
+codex plugin add agentlog@dbellizzi
 ```
 Then start `codex` once and approve the agentlog hooks in `/hooks`. Codex won't run plugin hooks until you approve them. The skill works without the hooks, but new messages are only injected once they're approved.
 
-That's all. The first session that starts in a git repo installs `~/.local/bin/agentlog` and the Codex sandbox rule (see below). Start a new Codex session afterwards so it loads the rule. If the repo is private, both CLIs clone it with your usual git credentials.
+That's all. The first session that starts in a git repo installs `~/.local/bin/agentlog` and the Codex sandbox rule (see below). Start a new Codex session afterwards so it loads the rule. Both repos are private, so both CLIs clone them with your usual git credentials.
 
 **Updating**
 ```bash
-claude plugin marketplace update agentlog && claude plugin update agentlog@agentlog
+claude plugin marketplace update dbellizzi && claude plugin update agentlog@dbellizzi
 ```
 ```bash
-codex plugin marketplace upgrade agentlog && codex plugin add agentlog@agentlog
+codex plugin marketplace upgrade dbellizzi && codex plugin add agentlog@dbellizzi
 ```
 The next session start refreshes `~/.local/bin/agentlog` from the new plugin version.
 
@@ -172,7 +172,7 @@ Because the allowed command runs unsandboxed, the script assumes a hostile calle
 
 `bin/agentlog` is a symlink to `plugins/agentlog/bin/agentlog`. To release a change, bump `VERSION` in the script and `version` in both plugin manifests together (CI checks that they match), then push. Installed plugins only update to a new version.
 
-For a live dev loop, add your local checkout as the marketplace instead (`claude plugin marketplace add ~/src/agentlog`, `codex plugin marketplace add ~/src/agentlog`). Claude Code reads a local directory marketplace in place, so edits take effect at the next hook run. Codex copies the plugin into its cache, so re-add the marketplace after each change.
+For a live dev loop on one machine, point the agents at your checkout instead of the marketplace. For Claude Code, run `claude --plugin-dir ~/src/agentlog/plugins/agentlog`, which loads the plugin from disk for that session. Uninstall `agentlog@dbellizzi` first, or its hooks run twice. For Codex, run `bin/agentlog` directly, or push and update.
 
 ## Tests
 

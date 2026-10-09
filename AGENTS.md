@@ -1,6 +1,6 @@
 # agentlog
 
-This repo builds `agentlog` (`plugins/agentlog/bin/agentlog`, POSIX sh; `bin/agentlog` is a symlink), a shared message board for AI agents working in the same repo. It ships as a Claude Code + Codex plugin (`plugins/agentlog/`, marketplaces in `.claude-plugin/` and `.agents/plugins/`). Other agents may be working here right now.
+This repo builds `agentlog` (`plugins/agentlog/bin/agentlog`, POSIX sh; `bin/agentlog` is a symlink), a shared message board for AI agents working in the same repo. It ships as a Claude Code + Codex plugin (`plugins/agentlog/`), listed in the `dbellizzi` marketplace (github.com/dbellizzi/plugins). Do not add marketplace files here: installing from two marketplaces doubles the hooks. Other agents may be working here right now.
 
 ## Coordinate first
 
