@@ -7,7 +7,9 @@ description: Coordinate with other AI agents (Claude Code, Codex, Cursor, openco
 
 A shared message board for agents working in the same repo. Every worktree of the repo shares one board. Messages are short, plain text, append-only.
 
-The command is `agentlog` if it is on PATH; otherwise use the path your session-start context gave you (in the agentlog repo itself: `bin/agentlog`). Your identity (agent name + session id) is detected automatically — run `agentlog whoami` to see it.
+Run agentlog by the exact command path your agentlog context gives you, normally `~/.local/bin/agentlog` written out as an absolute path. If no context has given a path, use `$HOME/.local/bin/agentlog`. In Codex, always use that absolute path. It is the only form allowed to write outside the sandbox. A bare `agentlog`, or `bin/agentlog` in this repo, still works, but from a sandboxed linked worktree its messages are held locally until a hook moves them to the shared board.
+
+Your identity (agent name + session id) is detected automatically; run `agentlog whoami` to see it. The examples below write `agentlog` for short.
 
 ## Reading
 

@@ -6,7 +6,11 @@ set -eu
 here=$(cd "$(dirname "$0")/.." && pwd)
 AL=$here/bin/agentlog
 root=$(mktemp -d "${TMPDIR:-/tmp}/agentlog-test.XXXXXX")
-trap 'rm -rf "$root"' EXIT
+trap 'chmod -R u+w "$root" 2>/dev/null; rm -rf "$root"' EXIT
+# Never touch the real home: hooks auto-install into ~/.local/bin and ~/.codex.
+export HOME="$root/home"
+mkdir -p "$HOME/.codex"
+unset CODEX_HOME AGENTLOG_PREFIX AGENTLOG_NO_INSTALL
 fails=0
 
 ok() { printf 'ok   %s\n' "$1"; }
@@ -123,8 +127,11 @@ check "claims: overlap warning on stderr" "run a aaaa1111 write -k claim -p x 'x
 # --- hook: valid JSON, silent when nothing new, identity from stdin
 fresh hook
 hj() { printf '{"session_id":"%s","hook_event_name":"%s","cwd":"/x"}' "$1" "$2"; }
+check "hook: SessionStart silent when no one else is here" "[ -z \"\$(hj aaaa1111 SessionStart | \"$AL\" hook claude-code)\" ]"
+check "hook: silent outside a git repo" "[ -z \"\$(cd \"$root\" && hj aaaa1111 SessionStart | env -u AGENTLOG_DIR \"$AL\" hook claude-code)\" ]"
+hj cccc3333 SessionStart | "$AL" hook codex >/dev/null
 out=$(hj aaaa1111 SessionStart | "$AL" hook claude-code)
-check "hook: SessionStart emits JSON" "printf '%s' \"\$out\" | jq -e '.hookSpecificOutput.hookEventName == \"SessionStart\"' >/dev/null"
+check "hook: SessionStart emits JSON once another session is active" "printf '%s' \"\$out\" | jq -e '.hookSpecificOutput.hookEventName == \"SessionStart\"' >/dev/null"
 check "hook: SessionStart states identity" "printf '%s' \"\$out\" | jq -r .hookSpecificOutput.additionalContext | grep -q 'claude-code:aaaa1111'"
 check "hook: silent PostToolUse with nothing new" "[ -z \"\$(hj aaaa1111 PostToolUse | \"$AL\" hook claude-code)\" ]"
 run codex bbbb2222 write -k request -t aaaa 'please "pause" \ now	tab' >/dev/null
@@ -191,5 +198,36 @@ out=$(cd "$repo" && run claude-code aaaa1111 read)
 check "worktree: unsandboxed run migrates local messages" "[ -f \"$shared/msgs/$sid.msg\" ] && [ -z \"\$(ls \"$side/.agentlog/msgs\")\" ]"
 check "worktree: migrated message delivered once" "[ \$(printf '%s\n' \"\$out\" | grep -c 'sandboxed claim') -eq 1 ] && [ -z \"\$(cd \"$repo\" && run claude-code aaaa1111 read)\" ]"
 check "worktree: local read cursor migrated" "[ -f \"$shared/seen/bbbb2222\" ] && [ ! -f \"$side/.agentlog/seen/bbbb2222\" ]"
+
+# --- install: copy outside the workspace + Codex allow rule, idempotent
+fresh install
+dest=$HOME/.local/bin/agentlog rules=$HOME/.codex/rules/agentlog.rules
+check "install: hook auto-installed on SessionStart" "[ -x \"$dest\" ] && cmp -s \"$AL\" \"$dest\" && [ -f \"$rules\" ]"
+check "install: rule allows only the absolute installed path" "grep -q 'pattern = \\[\"$dest\", \\[\"write\"' \"$rules\""
+check "install: rule never allows install/gc/hook/tail" "! grep -E '\"(install|gc|hook|tail)\"' \"$rules\""
+check "install: idempotent" "\"$AL\" install | grep -c 'up to date' | grep -qx 2"
+if command -v codex >/dev/null 2>&1; then
+  check "install: codex accepts the rule (write allowed)" "codex execpolicy check --rules \"$rules\" \"$dest\" write hi 2>/dev/null | grep -q '\"decision\":\"allow\"'"
+  check "install: codex does not allow install" "codex execpolicy check --rules \"$rules\" \"$dest\" install 2>/dev/null | grep -q '\"matchedRules\":\\[\\]'"
+fi
+check "install: AGENTLOG_NO_INSTALL respected" "rm -f \"$dest\"; hj dddd4444 SessionStart | AGENTLOG_NO_INSTALL=1 \"$AL\" hook x >/dev/null; [ ! -e \"$dest\" ]"
+check "install: --no-codex-rule" "rm -f \"$rules\"; \"$AL\" install --no-codex-rule >/dev/null; [ -x \"$dest\" ] && [ ! -e \"$rules\" ]"
+check "install: uninstall removes both" "\"$AL\" install >/dev/null; \"$AL\" install --uninstall >/dev/null; [ ! -e \"$dest\" ] && [ ! -e \"$rules\" ]"
+
+# --- hardening: hostile environment and arguments
+fresh harden
+mkdir -p "$root/evil"
+printf '#!/bin/sh\necho pwned >"%s/pwned"\n' "$root" >"$root/evil/git"
+chmod +x "$root/evil/git"
+cp "$root/evil/git" "$root/evil/perl"
+PATH="$root/evil:$PATH" PERL5OPT=-MNoSuchModule run a aaaa1111 write "hostile env" >/dev/null
+check "harden: PATH and PERL5OPT from the caller are ignored" "[ ! -e \"$root/pwned\" ] && run b bbbb2222 read | grep -q 'hostile env'"
+check "harden: dot session ids are neutralised" "[ \"\$(AGENTLOG_SESSION=../../x \"$AL\" whoami)\" = 'unknown:x (session x)' ]"
+victim=$root/victim
+mkdir -p "$victim/tmp" "$victim/msgs" "$victim/sessions"
+for f in tmp/keep msgs/notes.txt sessions/config; do echo data >"$victim/$f"; done
+touch -t 202001010000 "$victim"/tmp/keep "$victim"/msgs/notes.txt "$victim"/sessions/config
+AGENTLOG_DIR=$victim run a aaaa1111 gc --days 1
+check "harden: gc only deletes agentlog's own files" "[ -f \"$victim/tmp/keep\" ] && [ -f \"$victim/msgs/notes.txt\" ] && [ -f \"$victim/sessions/config\" ]"
 
 [ $fails -eq 0 ] && echo "all passed" || { echo "$fails failed"; exit 1; }

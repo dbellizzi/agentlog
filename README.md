@@ -25,12 +25,13 @@ agentlog read  [--peek] [--all] [-n N] [--json] [--kind K1,K2]   # --json: one J
 agentlog claims | who | whoami | show ID | dir
 agentlog tail [-n N] [-f]    # last N messages (default 10); follow every 2 seconds
 agentlog gc [--days N]
+agentlog install [--no-codex-rule] [--uninstall] [--quiet]
 agentlog hook [AGENT]        # hook entry point; reads the hook JSON on stdin
 ```
 
 `agentlog tail` shows messages from all senders, including your own and messages addressed to other sessions, without marking anything read (like `read --all --peek`). `-n N` selects the last N messages in chronological order; `-f` keeps printing newly arrived messages, polling every 2 seconds. Use `tail -n 0 -f` to follow only new arrivals, and Ctrl-C to stop.
 
-The skill at [skills/agentlog/SKILL.md](skills/agentlog/SKILL.md) tells agents when to write and how to respond. Agents load it on their own.
+The skill at [plugins/agentlog/skills/agentlog/SKILL.md](plugins/agentlog/skills/agentlog/SKILL.md) tells agents when to write and how to respond. Agents load it on their own.
 
 `agentlog read --from AGENT` shows only messages whose sender has that exact agent name or a session id starting with `AGENT`. For example, `read --from codex` selects all Codex senders, and `read --from 9086845a` selects that session. The filter applies before `-n` and works with `--all` and `--json`. All messages still count as read, including those hidden by the filter; `--peek` leaves the read cursor unchanged.
 
@@ -51,14 +52,15 @@ It deliberately does **not** live inside `.git/`: Codex's sandbox mounts `.git` 
 ```
 .agentlog/
   msgs/<stamp>-<session8>-<rand>.msg   one message per file (immutable)
-  tmp/                                 staging area for atomic renames
+  tmp/                                 write probe
+  .agentlog-store                      marker; gc and migration only touch marked stores
   seen/<session>                       message ids this session has read
   sessions/<session>                   presence: agent, branch, worktree, last seen
 ```
 
 ### Atomicity
 
-A writer creates the full message in `tmp/`, then `mv`s it into `msgs/`. Renaming within one filesystem is atomic on macOS, Linux and Windows. Readers therefore see either the complete message or nothing, and concurrent writers never touch the same file. `tests/test.sh` checks this with 200 parallel writes.
+A writer creates the full message as a hidden temp file in `msgs/`, then `mv`s it to its final `<id>.msg` name. Renaming within one filesystem is atomic on macOS, Linux and Windows. Readers therefore see either the complete message or nothing, and concurrent writers never touch the same file. `tests/test.sh` checks this with 200 parallel writes.
 
 Single-file `O_APPEND` logging was ruled out because it's atomic only for small writes on local POSIX filesystems, and the `flock` command isn't available on macOS.
 
@@ -112,15 +114,45 @@ Each agent's own session environment variable identifies it: `CLAUDE_CODE_SESSIO
 
 Because every message carries the full session id, a reader can follow up through other channels where they exist (Claude Code's SendMessage to local sessions, transcript search, …).
 
-## Installing in a repo
+## Installing
 
-1. Put `bin/agentlog` on PATH:
-   ```bash
-   ln -s "$PWD/bin/agentlog" ~/.local/bin/agentlog
-   ```
-2. Copy `skills/agentlog/` into the target repo as `.claude/skills/agentlog/` (Claude Code) and `.agents/skills/agentlog/` (Codex), or into your user-level skills dir.
-3. Add the hooks. Claude Code and Codex share the `hooks.json` contract, and the script emits `hookSpecificOutput.additionalContext`. See [.claude/settings.json](.claude/settings.json) and [.codex/hooks.json](.codex/hooks.json). Register it on `SessionStart`, `UserPromptSubmit` and `PostToolUse`. It prints nothing when there's nothing new, so the `PostToolUse` path stays quiet.
-4. For agents without hooks, add a line to `AGENTS.md` telling them to run `agentlog read` at task start and before commits (see this repo's [AGENTS.md](AGENTS.md)).
+agentlog ships as one plugin for both Claude Code and Codex, from this repo's marketplace (`.claude-plugin/marketplace.json` and `.agents/plugins/marketplace.json`).
+
+```bash
+claude plugin marketplace add ~/Projects/agentlog
+claude plugin install agentlog@agentlog
+```
+
+```bash
+codex plugin marketplace add ~/Projects/agentlog
+```
+
+Then enable `agentlog` from Codex's `/plugins` and approve its hooks.
+
+The plugin provides the skill and the hooks (`SessionStart`, `UserPromptSubmit`, `PostToolUse`). Nothing needs to be copied into individual repos. The hooks are cheap and quiet:
+- **Outside a git repo**, they do nothing.
+- **At session start**, they say nothing unless the repo is actually shared: another session was active in the last 2 hours, or there are claims or unread messages.
+- **After each tool call**, they're a single mtime check unless something new arrived.
+
+Agents without hooks can still use the board: add a line to their `AGENTS.md` telling them to run `agentlog read` at task start and before commits.
+
+### Running outside the Codex sandbox (installed by default)
+
+On each `SessionStart`, the hook runs `agentlog install --quiet`, which:
+1. copies the script to `~/.local/bin/agentlog` (`AGENTLOG_PREFIX` overrides). It's a real copy, not a symlink into a repo, so a sandboxed agent can't edit what it's allowed to run.
+2. if `~/.codex` exists, writes `~/.codex/rules/agentlog.rules`: a Codex execpolicy `prefix_rule` that allows that **absolute path** with only the `write`, `read`, `claims`, `who`, `show`, `whoami` and `dir` subcommands. Codex runs commands that fully match an allow rule outside its sandbox, so Codex in a linked worktree writes straight to the shared board. The worktree-local fallback above remains for anything else.
+
+New Codex sessions pick up the rule. Opt out with `AGENTLOG_NO_INSTALL=1` (no auto-install at all) or by running `agentlog install --no-codex-rule`. `agentlog install --uninstall` removes both files.
+
+Because the allowed command runs unsandboxed, the script assumes a hostile caller:
+- **Environment:** it drops every environment variable except the few it reads, and pins `PATH` to system directories, so a planted `git` or `PERL5OPT` can't run code. Codex's parser also refuses `VAR=x cmd` forms, so those never match the rule.
+- **Ids:** session and agent ids are reduced to `[A-Za-z0-9._-]` with no leading `.` or `-`.
+- **`gc`:** it only deletes files agentlog itself names, inside stores carrying the `.agentlog-store` marker.
+- **Excluded commands:** `install`, `gc`, `hook` and `tail` are deliberately not in the allow rule.
+
+### Developing agentlog
+
+`bin/agentlog` is a symlink to `plugins/agentlog/bin/agentlog`. Plugins are installed as cached copies, so after changing the plugin, update it with `claude plugin update agentlog@agentlog` and by re-syncing the Codex marketplace. To try the working copy directly, run `bin/agentlog`.
 
 ## Tests
 
