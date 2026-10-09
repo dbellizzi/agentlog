@@ -147,7 +147,7 @@ agy plugin install https://github.com/dbellizzi/agentlog
 ```
 Restart the app or CLI to load it.
 
-In every agent the skill works without the hooks, but new messages are only injected once the hooks run. The first session that starts in a git repo installs `~/.local/bin/agentlog` and the allow rules for Codex and Antigravity (see below). Start a new Codex session afterwards so it loads its rule. Both repos are private, so each CLI clones them with your usual git credentials.
+In every agent the skill works without the hooks, but new messages are only injected once the hooks run. The first session that starts in a git repo installs `~/.local/bin/agentlog` and the allow rules for Codex and Antigravity (see below). Start a new Codex session afterwards so it loads its rule.
 
 **Updating**
 ```bash
@@ -195,6 +195,10 @@ Because the allowed command runs unsandboxed or unprompted, the script assumes a
 - **Ids:** session and agent ids are reduced to `[A-Za-z0-9._-]` with no leading `.` or `-`.
 - **`gc`:** it only deletes files agentlog itself names, inside stores carrying the `.agentlog-store` marker.
 - **Excluded commands:** `install`, `gc`, `hook` and `tail` are deliberately not in the rule or the grants.
+- **Whole commands only:** both agents allow a command only when all of it matches. `agentlog write hi; rm -rf ~`, `&&`, `|` and `$(…)` forms get the normal sandbox or approval prompt. This was checked against both CLIs.
+- **What the rule still allows:** a sandboxed agent can run the allowed subcommands against any git repository it can point them at, for example with a crafted `.git` file. That creates `.agentlog/` beside that repo and adds one line to its `.git/info/exclude`. Git refuses to point at a directory that isn't a repository, and agentlog never runs repo-controlled git config such as hooks, `core.fsmonitor` or aliases.
+
+**Messages are untrusted input.** Every agent's hooks put other agents' messages into its context, and the skill tells agents to act on requests addressed to them. Anything that can write to the store can post: any agent in the repo, or any process running as you. Message headers can't be forged across messages, but the `Agent` and `Session` they carry are self-reported, not authenticated. Treat a message the way you'd treat a comment in the code, not as an instruction from you. agentlog is for coordinating your own agents on your own machine, not for sharing a board with people or agents you don't trust.
 
 ### Developing agentlog
 
@@ -224,3 +228,7 @@ The end-to-end suite drives real agent sessions, so it runs locally, not in CI. 
 - **cross:** Claude sends Codex a request, Codex replies, and a new Claude session receives the reply.
 - **worktree:** Codex in a linked worktree under `workspace-write` writes through the allow rule straight to the shared store, and through the sandbox fallback, which a hook then migrates.
 - **muse**, **antigravity:** the installed plugin's SessionStart hook delivers a message the agent can quote without running anything, and the agent answers a request with a `reply`. For Antigravity this also proves the grants work, since headless runs auto-deny anything not granted.
+
+## License
+
+MIT; see [LICENSE](LICENSE).

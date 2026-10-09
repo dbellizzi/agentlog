@@ -20,7 +20,7 @@ PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:/home/linuxb
 export PATH
 unset _v _keep
 
-VERSION=0.4.0
+VERSION=0.4.1
 # Resolve our own path now: hooks may cd into the workspace later, which
 # would break a relative $0 such as Antigravity's ./bin/agentlog.
 SELF=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
@@ -426,6 +426,7 @@ cmd_read() {
       *) die "read: unknown option $1" ;;
     esac
   done
+  case $limit in *[!0-9]*) die "read: -n needs a non-negative integer" ;; esac
   ensure_store
   work=$TMP/r
   : >"$work.start"
@@ -543,6 +544,7 @@ cmd_show() {
 cmd_gc() {
   days=7
   [ "${1:-}" = --days ] && { need "$@"; days=$2; }
+  case $days in '' | *[!0-9]*) die "gc: --days needs a non-negative integer" ;; esac
   ensure_store
   stores | while IFS= read -r st; do
     is_store "$st" || continue

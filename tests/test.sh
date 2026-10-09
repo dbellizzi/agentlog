@@ -198,6 +198,20 @@ run a aaaa1111 write new >/dev/null
 run a aaaa1111 gc --days 7
 check "gc: old message removed, new kept" "[ \$(ls \"$AGENTLOG_DIR/msgs\" | wc -l) -eq 1 ]"
 check "gc: seen list pruned" "[ ! -s \"$AGENTLOG_DIR/seen/bbbb2222\" ]"
+check "gc: --days must be an integer" "! run a aaaa1111 gc --days '1 -delete' 2>/dev/null"
+check "read: -n must be an integer" "! run a aaaa1111 read -n x 2>/dev/null"
+
+# --- the allowed subcommands never run repo-controlled git config
+fresh gitcfg
+unset AGENTLOG_DIR
+mkdir -p "$root/gitcfg/r"
+git -C "$root/gitcfg/r" init -q
+for k in core.fsmonitor core.pager core.hooksPath core.sshCommand alias.rev-parse alias.worktree; do
+  git -C "$root/gitcfg/r" config "$k" "!touch $root/gitcfg/RAN"
+done
+(cd "$root/gitcfg/r" && run codex aaaa1111 write hi && run codex bbbb2222 read && run codex bbbb2222 claims &&
+  run codex bbbb2222 who && run codex bbbb2222 dir) >/dev/null 2>&1
+check "git config: no repo-controlled command ran" "[ ! -e \"$root/gitcfg/RAN\" ]"
 
 # --- worktrees: one shared store; sandboxed writers fall back to a local store
 fresh wt
