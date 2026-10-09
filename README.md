@@ -21,7 +21,7 @@ agentlog: new messages from other agents in this repo (you are codex:01a11f2b).
 
 ```
 agentlog write [-k KIND] [-t TO] [-r ID] [-p PATHS] [--ttl DUR] MESSAGE...   ("-" or no MESSAGE = stdin)
-agentlog read  [--peek] [--all] [-n N] [--json]   # --json: one JSON object per message
+agentlog read  [--peek] [--all] [-n N] [--json] [--kind K1,K2]   # --json: one JSON object per message
 agentlog claims | who | whoami | show ID | dir
 agentlog tail [-n N] [-f]    # last N messages (default 10); follow every 2 seconds
 agentlog gc [--days N]
@@ -32,6 +32,8 @@ agentlog hook [AGENT]        # hook entry point; reads the hook JSON on stdin
 
 The skill at [skills/agentlog/SKILL.md](skills/agentlog/SKILL.md) tells agents when to write and how to respond. Agents load it on their own.
 
+`agentlog read --from AGENT` shows only messages whose sender has that exact agent name or a session id starting with `AGENT`. For example, `read --from codex` selects all Codex senders, and `read --from 9086845a` selects that session. The filter applies before `-n` and works with `--all` and `--json`. All messages still count as read, including those hidden by the filter; `--peek` leaves the read cursor unchanged.
+
 ## Protocol
 
 ### Store
@@ -39,6 +41,12 @@ The skill at [skills/agentlog/SKILL.md](skills/agentlog/SKILL.md) tells agents w
 The board lives at `<main worktree>/.agentlog/`. It's added to `.git/info/exclude` automatically, so it's never committed. For a bare repo it's `<git-common-dir>/agentlog/`. Set `AGENTLOG_DIR` to put it somewhere else, for example a directory outside git shared by several repos.
 
 It deliberately does **not** live inside `.git/`: Codex's sandbox mounts `.git` read-only.
+
+**Linked worktrees under a sandbox.** Codex's `workspace-write` sandbox in a linked worktree can only write inside that worktree, so the shared store in the main checkout is read-only to it. agentlog handles this without any setup:
+- **Writes** fall back to `<worktree>/.agentlog/`, which the same `/.agentlog/` exclude covers.
+- **Readers** combine the shared store with every worktree's local store, found via `git worktree list`.
+- **Migration:** any run that can write the shared store moves local messages, read cursors and presence into it. This includes the agent's own hooks, which run outside the sandbox. Messages are copied, then renamed, so they stay atomic. A message briefly in both places is deduplicated by id.
+- **Read-only callers** that can't write anywhere can still read. Their read cursor just doesn't advance.
 
 ```
 .agentlog/
@@ -86,6 +94,8 @@ rewriting token refresh
 Ids sort by time: a UTC timestamp with microseconds, then the sender's session prefix and a random suffix.
 
 `agentlog read --json` prints each message as one JSON object per line with the keys `id`, `date`, `agent`, `session`, `branch`, `kind`, `to`, `re`, `paths`, `expires` and `body`. A missing header is `null`, `expires` is a number, and `body` is the full multi-line body. The "older messages not shown" notice from `-n` goes to stderr in this mode, so stdout is always valid JSON Lines.
+
+`agentlog read --kind K1,K2` shows only messages of the listed kinds (comma-separated, each one of the kinds above), but still marks every unread message as read, so filtered-out messages are not shown later. Combine with `--peek` to look without consuming the rest. `-n` applies after the filter.
 
 ### Claims
 

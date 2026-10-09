@@ -59,6 +59,26 @@ check "read: second read empty" "[ -z \"\$(run codex cccc3333 read)\" ]"
 check "read: multi-line body kept" "run x dddd4444 write 'line one
 line two' >/dev/null && run y eeee5555 read | grep -q '^    line two$'"
 
+# --- read --from: exact agent name or session prefix, display-only filtering
+fresh from
+run codex bbbb2222 write 'from first codex' >/dev/null
+run codex cccc3333 write 'from second codex' >/dev/null
+run codex-extra dddd4444 write 'from other agent' >/dev/null
+run codex bbbb2222 write -t elsewhere 'from private message' >/dev/null
+run reader aaaa1111 write 'from own message' >/dev/null
+out=$(run reader aaaa1111 read --from codex --peek)
+check "from: exact agent name selects all its sessions" "printf '%s' \"\$out\" | grep -q 'from first codex' && printf '%s' \"\$out\" | grep -q 'from second codex' && ! printf '%s' \"\$out\" | grep -q 'from other agent'"
+check "from: delivery addressing preserved" "! printf '%s' \"\$out\" | grep -q 'from private message'"
+out=$(run reader aaaa1111 read --from bbbb --peek)
+check "from: session prefix selects only that sender" "printf '%s' \"\$out\" | grep -q 'from first codex' && ! printf '%s' \"\$out\" | grep -q 'from second codex'"
+out=$(run reader aaaa1111 read --from codex -n 1)
+check "from: peek preserves unread and filter precedes limit" "printf '%s' \"\$out\" | grep -q 'from second codex' && ! printf '%s' \"\$out\" | grep -q 'from first codex'"
+check "from: hidden messages also marked read" "[ -z \"\$(run reader aaaa1111 read)\" ]"
+out=$(run reader aaaa1111 read --all --from aaaa --json --peek)
+check "from: all and json support own sender prefix" "printf '%s' \"\$out\" | jq -e '.body == \"from own message\"' >/dev/null"
+check "from: no matches still marks all read" "[ -z \"\$(run reader eeee5555 read --from absent)\" ] && [ -z \"\$(run reader eeee5555 read)\" ]"
+check "from: missing or empty value rejected" "! run reader aaaa1111 read --from 2>/dev/null && ! run reader aaaa1111 read --from '' 2>/dev/null"
+
 # --- read --json: one valid object per message, escaping, nulls, -n notice on stderr
 fresh json
 c=$(run codex bbbb2222 write -k claim -p 'src/**' 'claim "quoted" \ back	tab
@@ -71,6 +91,17 @@ check "json: all fields present" "printf '%s\n' \"\$out\" | head -1 | jq -e 'key
 check "json: claim fields and escaped body" "printf '%s\n' \"\$out\" | head -1 | jq -e --arg c \"$c\" '.id == \$c and .kind == \"claim\" and .paths == \"src/**\" and .agent == \"codex\" and .session == \"bbbb2222\" and .re == null and (.expires | type) == \"number\" and .body == \"claim \\\"quoted\\\" \\\\ back\\ttab\\nsecond line\"' >/dev/null"
 check "json: reply fields" "printf '%s\n' \"\$out\" | tail -1 | jq -e --arg c \"$c\" '.re == \$c and .to == \"aaaa\" and .paths == null and .expires == null and .body == \"plain reply\"' >/dev/null"
 check "json: -n notice goes to stderr" "[ \$(run claude-code aaaa1111 read --json -n 1 2>/dev/null | jq -c . | wc -l) -eq 1 ] && run claude-code aaaa1111 read --all --json -n 1 2>&1 >/dev/null | grep -q 'not shown'"
+
+# --- read --kind: show only listed kinds, still mark everything read
+fresh kind
+run codex bbbb2222 write "kind note" >/dev/null
+run codex bbbb2222 write -k request -t aaaa "kind request" >/dev/null
+run codex bbbb2222 write -k claim -p 'x/' "kind claim" 2>/dev/null >/dev/null
+out=$(run claude-code aaaa1111 read --peek --kind request,claim)
+check "kind: listed kinds shown" "printf '%s' \"\$out\" | grep -q 'kind request' && printf '%s' \"\$out\" | grep -q 'kind claim'"
+check "kind: other kinds hidden" "! printf '%s' \"\$out\" | grep -q 'kind note'"
+check "kind: unknown kind rejected" "! run claude-code aaaa1111 read --kind bogus 2>/dev/null"
+check "kind: filtered read marks all read" "[ \$(run claude-code aaaa1111 read --kind note | grep -c '^\[') -eq 1 ] && [ -z \"\$(run claude-code aaaa1111 read)\" ]"
 
 # --- claims: expiry, release by id, bare release
 fresh claims
@@ -136,7 +167,7 @@ fresh wt
 unset AGENTLOG_DIR
 mkdir -p "$root/wt/repo"
 repo=$(cd "$root/wt/repo" && pwd -P)
-git -C "$repo" init -q -b main && git -C "$repo" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+git -C "$repo" init -q -b main && git -C "$repo" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q --allow-empty -m init
 git -C "$repo" worktree add -q -b side "$root/wt/side"
 side=$(cd "$root/wt/side" && pwd -P)
 shared=$repo/.agentlog

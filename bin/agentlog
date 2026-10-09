@@ -218,8 +218,9 @@ agentlog — shared message board for agents working in the same repo
                  MESSAGE may be "-" (or omitted) to read the body from stdin.
                  KIND: note (default) | claim | release | request | reply | done
                  TO:   * (default) | agent name (codex, claude-code) | session-id prefix
-  agentlog read  [--peek] [--all] [-n N] [--json]
+  agentlog read  [--peek] [--all] [-n N] [--json] [--kind K1,K2]
                  unread messages for this session (--json: JSON Lines)
+                 [--from AGENT] show only that agent name or session-id prefix; marks all read
   agentlog tail [-n N] [-f]                last N messages (10); follow every 2s
   agentlog claims                          active claims (who is working on what)
   agentlog who                             sessions active in the last 24h
@@ -362,13 +363,17 @@ fmt_json() {
 # A message is for this session if another session sent it to "*", to this
 # agent's name, or to a prefix of this session id.
 cmd_read() {
+  read_from=''
   peek=0 all=0 limit='' fmt=fmt_msgs
+  read_kind=''
   while [ $# -gt 0 ]; do
     case $1 in
+      --from) need "$@"; [ -n "$2" ] || die "read: --from needs a non-empty value"; read_from=$2; shift 2 ;;
       --peek) peek=1; shift ;;
       --all) all=1; shift ;;
       --json) fmt=fmt_json; shift ;;
       -n) need "$@"; limit=$2; shift 2 ;;
+      --kind) need "$@"; read_kind=$2; shift 2 ;;
       *) die "read: unknown option $1" ;;
     esac
   done
@@ -378,14 +383,25 @@ cmd_read() {
   cat "$STORE/seen/$SESSION" ${LOCAL:+"$LOCAL/seen/$SESSION"} 2>/dev/null | sort -u >"$seen" || :
   if [ $all -eq 1 ]; then
     index >"$work.new"
-    cp "$work.new" "$work.del"
+    awk -F '\t' -v from="$read_from" '
+      from == "" || $3 == from || index($4, from) == 1
+    ' "$work.new" >"$work.del"
   else
     index | awk -F '\t' -v seen="$seen" '
       BEGIN { while ((getline l <seen) > 0) s[l] = 1 }
       !($1 in s)' >"$work.new"
-    awk -F '\t' -v me="$SESSION" -v agent="$AGENT" '
-      $4 != me && ($5 == "*" || $5 == "" || $5 == agent || index(me, $5) == 1)
+    awk -F '\t' -v me="$SESSION" -v agent="$AGENT" -v from="$read_from" '
+      $4 != me && ($5 == "*" || $5 == "" || $5 == agent || index(me, $5) == 1) &&
+        (from == "" || $3 == from || index($4, from) == 1)
     ' "$work.new" >"$work.del"
+  fi
+  if [ -n "$read_kind" ]; then
+    # Only hide non-matching kinds from output; $work.new still marks all read.
+    for k in $(printf '%s' "$read_kind" | tr ',' ' '); do
+      case " $KINDS " in *" $k "*) ;; *) die "read: --kind must be from: $KINDS" ;; esac
+    done
+    awk -F '\t' -v kinds=",$read_kind," 'index(kinds, "," $2 ",")' "$work.del" >"$work.k"
+    mv "$work.k" "$work.del"
   fi
   total=$(wc -l <"$work.del" | tr -d ' ')
   if [ -n "$limit" ] && [ "$total" -gt "$limit" ]; then
