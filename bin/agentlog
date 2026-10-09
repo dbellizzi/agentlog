@@ -151,7 +151,9 @@ agentlog — shared message board for agents working in the same repo
                  MESSAGE may be "-" (or omitted) to read the body from stdin.
                  KIND: note (default) | claim | release | request | reply | done
                  TO:   * (default) | agent name (codex, claude-code) | session-id prefix
-  agentlog read  [--peek] [--all] [-n N]   unread messages for this session
+  agentlog read  [--peek] [--all] [-n N] [--json]
+                 unread messages for this session (--json: JSON Lines)
+  agentlog tail [-n N] [-f]                last N messages (10); follow every 2s
   agentlog claims                          active claims (who is working on what)
   agentlog who                             sessions active in the last 24h
   agentlog show ID                         print one message in full
@@ -255,16 +257,49 @@ fmt_msgs() {
   '
 }
 
+# Print messages as JSON Lines, one object per message. File paths on stdin.
+# Missing headers are null; expires is a number. Escaping is done per
+# character because backslashes in gsub replacements differ across awks.
+fmt_json() {
+  # shellcheck disable=SC2016
+  tr '\n' '\0' | xargs -0 awk '
+    BEGIN {
+      for (i = 1; i < 32; i++) esc[sprintf("%c", i)] = sprintf("\\u%04x", i)
+      esc["\n"] = "\\n"; esc["\t"] = "\\t"; esc["\r"] = "\\r"
+      esc["\""] = "\\\""; esc["\\"] = "\\\\"
+    }
+    function js(v,   o, c, i) {
+      o = ""
+      for (i = 1; i <= length(v); i++) { c = substr(v, i, 1); o = o ((c in esc) ? esc[c] : c) }
+      return "\"" o "\""
+    }
+    function opt(v) { return (v == "") ? "null" : js(v) }
+    function out() {
+      if (!any) return
+      printf "{\"id\":%s,\"date\":%s,\"agent\":%s,\"session\":%s,\"branch\":%s,\"kind\":%s,\"to\":%s,\"re\":%s,\"paths\":%s,\"expires\":%s,\"body\":%s}\n",
+        opt(h["Id"]), opt(h["Date"]), opt(h["Agent"]), opt(h["Session"]), opt(h["Branch"]),
+        opt(h["Kind"]), opt(h["To"]), opt(h["Re"]), opt(h["Paths"]),
+        (h["Expires"] ~ /^[0-9]+$/) ? h["Expires"] : "null", js(body)
+    }
+    FNR == 1 { out(); any = 1; inh = 1; body = ""; nb = 0; split("", h) }
+    inh && /^$/ { inh = 0; next }
+    inh { key = $0; sub(/:.*/, "", key); val = $0; sub(/^[^:]*: ?/, "", val); h[key] = val; next }
+    { body = (nb++ ? body "\n" : "") $0 }
+    END { out() }
+  '
+}
+
 # Delivery is at-least-once: the seen list is merged by rename, so two
 # concurrent readers in one session can at worst both show a message.
 # A message is for this session if another session sent it to "*", to this
 # agent's name, or to a prefix of this session id.
 cmd_read() {
-  peek=0 all=0 limit=''
+  peek=0 all=0 limit='' fmt=fmt_msgs
   while [ $# -gt 0 ]; do
     case $1 in
       --peek) peek=1; shift ;;
       --all) all=1; shift ;;
+      --json) fmt=fmt_json; shift ;;
       -n) need "$@"; limit=$2; shift 2 ;;
       *) die "read: unknown option $1" ;;
     esac
@@ -287,17 +322,55 @@ cmd_read() {
   total=$(wc -l <"$work.del" | tr -d ' ')
   if [ -n "$limit" ] && [ "$total" -gt "$limit" ]; then
     # shellcheck disable=SC2016
-    printf '(%s older unread messages not shown; `agentlog read --all -n %s` to see them)\n' \
-      "$((total - limit))" "$total"
+    notice=$(printf '(%s older unread messages not shown; `agentlog read --all -n %s` to see them)' \
+      "$((total - limit))" "$total")
+    if [ "$fmt" = fmt_json ]; then printf '%s\n' "$notice" >&2; else printf '%s\n' "$notice"; fi
     tail -n "$limit" "$work.del" >"$work.lim"; mv "$work.lim" "$work.del"
   fi
-  [ -s "$work.del" ] && cut -f1 "$work.del" | sed "s|.*|$STORE/msgs/&.msg|" | fmt_msgs
+  [ -s "$work.del" ] && cut -f1 "$work.del" | sed "s|.*|$STORE/msgs/&.msg|" | "$fmt"
 
   if [ $peek -eq 0 ] && [ -s "$work.new" ]; then
     cut -f1 "$work.new" | sort -u "$seen" - | atomic_write "$seen"
   fi
   rm -f "$work.new" "$work.del"
   touch_presence
+}
+
+# Observe all senders without changing this session's read cursor. Keep a
+# snapshot of ids so following also catches messages published out of order.
+cmd_tail() {
+  limit=10 follow=0
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -n) need "$@"; limit=$2; shift 2 ;;
+      -f) follow=1; shift ;;
+      *) die "tail: unknown option $1" ;;
+    esac
+  done
+  case $limit in
+    '' | *[!0-9]*) die "tail: -n needs a non-negative integer" ;;
+  esac
+  ensure_store
+  work=$STORE/tmp/.tail.$$.$(rand)
+  trap 'rm -f "$work.index" "$work.ids" "$work.del"' 0
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  index >"$work.index"
+  cut -f1 "$work.index" >"$work.ids"
+  tail -n "$limit" "$work.index" >"$work.del"
+  touch_presence
+  while :; do
+    if [ -s "$work.del" ]; then
+      cut -f1 "$work.del" | sed "s|.*|$STORE/msgs/&.msg|" | fmt_msgs
+    fi
+    [ "$follow" -eq 1 ] || break
+    sleep 2
+    index >"$work.index"
+    awk -F '\t' -v seen="$work.ids" '
+      BEGIN { while ((getline id <seen) > 0) s[id] = 1 }
+      !($1 in s)' "$work.index" >"$work.del"
+    cut -f1 "$work.index" >"$work.ids"
+  done
 }
 
 cmd_claims() {
@@ -415,6 +488,7 @@ detect_identity
 case $cmd in
   write | w) cmd_write "$@" ;;
   read | r) cmd_read "$@" ;;
+  tail) cmd_tail "$@" ;;
   claims) cmd_claims ;;
   who) cmd_who ;;
   show) cmd_show "$@" ;;

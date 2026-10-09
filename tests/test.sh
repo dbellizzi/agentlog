@@ -59,6 +59,19 @@ check "read: second read empty" "[ -z \"\$(run codex cccc3333 read)\" ]"
 check "read: multi-line body kept" "run x dddd4444 write 'line one
 line two' >/dev/null && run y eeee5555 read | grep -q '^    line two$'"
 
+# --- read --json: one valid object per message, escaping, nulls, -n notice on stderr
+fresh json
+c=$(run codex bbbb2222 write -k claim -p 'src/**' 'claim "quoted" \ back	tab
+second line' 2>/dev/null)
+run codex bbbb2222 write -k reply -r "$c" -t aaaa "plain reply" >/dev/null
+out=$(run claude-code aaaa1111 read --json --peek)
+check "json: one line per message" "[ \$(printf '%s\n' \"\$out\" | wc -l) -eq 2 ]"
+check "json: every line parses" "printf '%s\n' \"\$out\" | jq -e . >/dev/null"
+check "json: all fields present" "printf '%s\n' \"\$out\" | head -1 | jq -e 'keys == ([\"agent\",\"body\",\"branch\",\"date\",\"expires\",\"id\",\"kind\",\"paths\",\"re\",\"session\",\"to\"] | sort)' >/dev/null"
+check "json: claim fields and escaped body" "printf '%s\n' \"\$out\" | head -1 | jq -e --arg c \"$c\" '.id == \$c and .kind == \"claim\" and .paths == \"src/**\" and .agent == \"codex\" and .session == \"bbbb2222\" and .re == null and (.expires | type) == \"number\" and .body == \"claim \\\"quoted\\\" \\\\ back\\ttab\\nsecond line\"' >/dev/null"
+check "json: reply fields" "printf '%s\n' \"\$out\" | tail -1 | jq -e --arg c \"$c\" '.re == \$c and .to == \"aaaa\" and .paths == null and .expires == null and .body == \"plain reply\"' >/dev/null"
+check "json: -n notice goes to stderr" "[ \$(run claude-code aaaa1111 read --json -n 1 2>/dev/null | jq -c . | wc -l) -eq 1 ] && run claude-code aaaa1111 read --all --json -n 1 2>&1 >/dev/null | grep -q 'not shown'"
+
 # --- claims: expiry, release by id, bare release
 fresh claims
 c1=$(run a aaaa1111 write -k claim -p 'src/**' "refactor src")
@@ -93,6 +106,20 @@ check "hook: registers presence" "[ -f \"$AGENTLOG_DIR/sessions/aaaa1111\" ] && 
 fresh ident
 check "identity: Claude Code env" "[ \"\$(CLAUDE_CODE_SESSION_ID=abc123456789 \"$AL\" whoami)\" = 'claude-code:abc12345 (session abc123456789)' ]"
 check "identity: Codex env" "CODEX_SESSION_ID=01a11f2b-x \"$AL\" whoami | grep -q '^codex:01a11f2b'"
+
+# --- tail: last N across all senders, with no read cursor changes
+fresh tail
+run a aaaa1111 write 'tail oldest' >/dev/null
+run b bbbb2222 write -t elsewhere 'tail directed' >/dev/null
+run a aaaa1111 write 'tail own newest' >/dev/null
+out=$(run a aaaa1111 tail -n 2)
+check "tail: exactly the last N messages in order" "[ \"\$(printf '%s\n' \"\$out\" | grep '^    ')\" = '    tail directed
+    tail own newest' ]"
+check "tail: leaves read cursor untouched" "[ ! -e \"$AGENTLOG_DIR/seen/aaaa1111\" ]"
+check "tail: repeat shows the same messages" "[ \"\$(run a aaaa1111 tail -n 2)\" = \"\$out\" ]"
+check "tail: zero messages" "[ -z \"\$(run a aaaa1111 tail -n 0)\" ]"
+check "tail: rejects invalid counts" "! run a aaaa1111 tail -n nope 2>/dev/null && ! run a aaaa1111 tail -n -1 2>/dev/null"
+check "tail: no temp files left" "[ -z \"\$(ls -A \"$AGENTLOG_DIR/tmp\")\" ]"
 
 # --- gc
 fresh gc

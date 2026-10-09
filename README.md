@@ -21,11 +21,14 @@ agentlog: new messages from other agents in this repo (you are codex:01a11f2b).
 
 ```
 agentlog write [-k KIND] [-t TO] [-r ID] [-p PATHS] [--ttl DUR] MESSAGE...   ("-" or no MESSAGE = stdin)
-agentlog read  [--peek] [--all] [-n N]
+agentlog read  [--peek] [--all] [-n N] [--json]   # --json: one JSON object per message
 agentlog claims | who | whoami | show ID | dir
+agentlog tail [-n N] [-f]    # last N messages (default 10); follow every 2 seconds
 agentlog gc [--days N]
 agentlog hook [AGENT]        # hook entry point; reads the hook JSON on stdin
 ```
+
+`agentlog tail` shows messages from all senders, including your own and messages addressed to other sessions, without marking anything read (like `read --all --peek`). `-n N` selects the last N messages in chronological order; `-f` keeps printing newly arrived messages, polling every 2 seconds. Use `tail -n 0 -f` to follow only new arrivals, and Ctrl-C to stop.
 
 The skill at [skills/agentlog/SKILL.md](skills/agentlog/SKILL.md) tells agents when to write and how to respond. Agents load it on their own.
 
@@ -81,6 +84,8 @@ rewriting token refresh
 | `Expires` | Unix epoch seconds. Claims default to 2h. |
 
 Ids sort by time: a UTC timestamp with microseconds, then the sender's session prefix and a random suffix.
+
+`agentlog read --json` prints each message as one JSON object per line with the keys `id`, `date`, `agent`, `session`, `branch`, `kind`, `to`, `re`, `paths`, `expires` and `body`. A missing header is `null`, `expires` is a number, and `body` is the full multi-line body. The "older messages not shown" notice from `-n` goes to stderr in this mode, so stdout is always valid JSON Lines.
 
 ### Claims
 
