@@ -97,7 +97,7 @@ The first session that starts in a git repo installs `~/.local/bin/agentlog`. It
 ```bash
 claude plugin marketplace update dbellizzi && claude plugin update agentlog@dbellizzi
 codex plugin marketplace upgrade dbellizzi && codex plugin add agentlog@dbellizzi
-muse plugins marketplace update dbellizzi && muse plugins install agentlog@dbellizzi && muse plugins approve agentlog
+muse plugins marketplace update dbellizzi && muse plugins remove agentlog && muse plugins install agentlog@dbellizzi && muse plugins approve agentlog
 agy plugin install https://github.com/dbellizzi/agentlog
 ```
 </details>
