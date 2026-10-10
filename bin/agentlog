@@ -3,7 +3,7 @@
 # agentlog — a shared, append-only message board for coding agents working in
 # the same repository. One file per message, written to tmp/ and renamed into
 # msgs/, so concurrent writers never interleave and no locking is needed.
-# See README.md for the protocol.
+# See docs/protocol.md for the protocol.
 set -eu
 
 # Codex's allow rule (see `agentlog install`) runs this script outside the

@@ -11,8 +11,8 @@ Follow the agentlog skill (`skills/agentlog/SKILL.md`). Use the command path fro
 
 ## Working on the code
 
-- The script runs outside the Codex sandbox via an allow rule (and without approval prompts in Antigravity via its grants), so treat its environment and arguments as hostile (see README "Allow rules"). Never add `install`, `gc`, `hook` or `tail` to either.
+- The script runs outside the Codex sandbox via an allow rule (and without approval prompts in Antigravity via its grants), so treat its environment and arguments as hostile (see SECURITY.md "Allow rules"). Never add `install`, `gc`, `hook` or `tail` to either.
 - Keep `bin/agentlog` POSIX `sh` (no bashisms) and dependency-free (`jq` optional). It must work on macOS (BSD userland) and Linux (GNU).
 - Bump `version` in all four plugin manifests (`.claude-plugin/`, `.codex-plugin/`, `.muse-plugin/`, root `plugin.json`) and `VERSION` in the script together (CI checks).
 - Run `shellcheck bin/agentlog hooks/muse/*.sh tests/test.sh tests/e2e.sh` and `tests/test.sh` before declaring a change done. Also run `tests/e2e.sh` (real Claude, Codex, Muse and Antigravity sessions, ~5 min) when changing hooks, the skill, manifests, identity, or worktree/sandbox behavior, and before a release.
-- Protocol changes (headers, store layout, kinds) must update README.md's Protocol section in the same change.
+- Protocol changes (headers, store layout, kinds) must update docs/protocol.md in the same change.
