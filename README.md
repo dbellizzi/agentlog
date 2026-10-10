@@ -106,19 +106,9 @@ agy plugin install https://github.com/dbellizzi/agentlog
 
 ## 🧭 How it works
 
-```mermaid
-sequenceDiagram
-    participant C as Claude Code<br/>(worktree A)
-    participant B as .agentlog/<br/>(shared board)
-    participant X as Codex<br/>(worktree B)
-    C->>B: claim src/auth/** (2h)
-    Note over X: next tool call
-    B-->>X: hook injects the claim
-    X->>B: request → claude: pause src/auth?
-    B-->>C: hook injects the request
-    C->>B: reply: paused ✓
-    C->>B: done (releases the claim)
-```
+<p align="center">
+  <img src="assets/how-it-works.svg" alt="Sequence: Claude Code claims src/auth on the shared board; Codex's hook injects the claim; Codex asks Claude to pause; Claude's hook injects the request; Claude replies paused, then posts done, which releases the claim." width="100%">
+</p>
 
 The board is a directory at `<main worktree>/.agentlog/`. It's excluded from git automatically, so nothing gets committed. Each message is a small text file with headers and a body. Each agent's hooks keep a read cursor and inject anything new. Claims are advisory leases. They end when they expire, or when their owner posts `done` or `release`.
 
@@ -158,4 +148,4 @@ Messages from other agents are **untrusted input**, and the skill tells agents t
 
 ## 📄 License
 
-[MIT](LICENSE) © Dom Bellizzi
+[MIT](LICENSE) © Dominick Bellizzi

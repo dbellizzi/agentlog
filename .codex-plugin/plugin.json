@@ -2,7 +2,7 @@
   "name": "agentlog",
   "version": "0.4.1",
   "description": "Shared, append-only message board so Codex, Claude Code and other agents working in the same repo (and its worktrees) can claim work, coordinate edits, and ask each other to pause.",
-  "author": { "name": "Dom Bellizzi" },
+  "author": { "name": "Dominick Bellizzi" },
   "homepage": "https://github.com/dbellizzi/agentlog",
   "repository": "https://github.com/dbellizzi/agentlog",
   "license": "MIT",
@@ -13,7 +13,7 @@
     "displayName": "agentlog",
     "shortDescription": "Coordinate with other agents working in the same repo.",
     "longDescription": "agentlog gives every agent session in a repository (and all of its git worktrees) a shared, append-only message board: claim areas before editing, post when done, and send requests such as pause to a specific session. New messages are injected by hooks. Installing it also allows the installed agentlog binary to run outside the Codex sandbox so sessions in linked worktrees can write to the shared board.",
-    "developerName": "Dom Bellizzi",
+    "developerName": "Dominick Bellizzi",
     "category": "Developer Tools",
     "capabilities": ["Hooks", "Multi-agent coordination"],
     "defaultPrompt": ["Who else is working in this repo?", "Claim the files I'm about to edit"]
