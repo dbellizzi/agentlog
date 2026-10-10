@@ -191,6 +191,61 @@ git init -q "$agr"
 check "hook: relative \$0 still resolves after cd (Antigravity runs ./bin/agentlog)" "(cd \"\$(dirname \"$AL\")/..\" && aj agyc0003 \"$agr\" | ./bin/agentlog hook antigravity SessionStart | jq -r '.injectSteps[0].ephemeralMessage' | grep -q 'Command: /[^ ]*/agentlog ')"
 check "hook: antigravity finds the repo from workspacePaths, not its cwd" "(cd \"$root\" && aj agyc0002 \"$agr\" | env -u AGENTLOG_DIR \"$AL\" hook antigravity SessionStart >/dev/null); [ -f \"$agr/.agentlog/sessions/agyc0002\" ]"
 
+# --- hook: editing a file inside another session's claim warns once per claim
+fresh edits
+er=$root/edit-repo
+git init -q "$er"
+mkdir -p "$er/src/auth" "$er/sub"
+pj() { # pj SESSION TOOL TOOL_INPUT-JSON
+  printf '{"session_id":"%s","hook_event_name":"PostToolUse","cwd":"%s","tool_name":"%s","tool_input":%s,"tool_response":{"file_path":"%s/elsewhere/ignored.ts"}}' "$1" "${PJ_CWD:-$er}" "$2" "$3" "$er"
+}
+ctx() { jq -r '.hookSpecificOutput.additionalContext // empty'; }
+run claude-code bbbb2222 write -k claim -p 'src/auth/** docs/guide.md lib/' "rewriting auth" >/dev/null 2>&1
+run claude-code bbbb2222 write -k claim -p 'tools/x.ts:main' "symbol claim" >/dev/null 2>&1
+hj aaaa1111 SessionStart | "$AL" hook codex >/dev/null
+out=$(pj aaaa1111 Read "{\"file_path\":\"$er/src/auth/token.ts\"}" | "$AL" hook codex | ctx)
+check "edits: reading a claimed file stays silent" "! printf '%s' \"\$out\" | grep -q 'you edited'"
+out=$(pj aaaa1111 Edit "{\"file_path\":\"$er/README.md\"}" | "$AL" hook codex | ctx)
+check "edits: editing an unclaimed file stays silent" "! printf '%s' \"\$out\" | grep -q 'you edited'"
+out=$(pj aaaa1111 Edit "{\"file_path\":\"$er/src/auth/token.ts\",\"old_string\":\"a\"}" | "$AL" hook codex | ctx)
+check "edits: Edit inside a glob claim warns with owner and file" "printf '%s' \"\$out\" | grep -q 'bbbb2222' && printf '%s' \"\$out\" | grep -q 'you edited: src/auth/token.ts'"
+out=$(pj aaaa1111 Write "{\"file_path\":\"$er/src/auth/other.ts\"}" | "$AL" hook codex | ctx)
+check "edits: the same claim warns only once per session" "! printf '%s' \"\$out\" | grep -q 'you edited'"
+out=$(pj cccc3333 apply_patch '{"input":"*** Begin Patch\n*** Update File: lib/pool.ts\n@@\n-a\n+b\n*** End Patch\n"}' | "$AL" hook codex | ctx)
+check "edits: apply_patch Update File inside a directory claim warns" "printf '%s' \"\$out\" | grep -q 'you edited: lib/pool.ts'"
+out=$(pj dddd4444 Bash '{"command":["apply_patch","*** Begin Patch\n*** Add File: docs/guide.md\n+hi\n*** End Patch\n"]}' | "$AL" hook codex | ctx)
+check "edits: apply_patch Add File via a shell command warns" "printf '%s' \"\$out\" | grep -q 'you edited: docs/guide.md'"
+out=$(PJ_CWD=$er/sub pj eeee5555 Edit '{"file_path":"../tools/x.ts"}' | "$AL" hook codex | ctx)
+out=$(PJ_CWD=$er/src pj eeee5555 Edit '{"file_path":"auth/z.ts"}' | "$AL" hook codex | ctx)
+check "edits: relative path from a subdirectory resolves against the repo root" "printf '%s' \"\$out\" | grep -q 'you edited: src/auth/z.ts'"
+out=$(pj ffff6666 NotebookEdit "{\"notebook_path\":\"$er/tools/x.ts\"}" | "$AL" hook codex | ctx)
+check "edits: a path:symbol claim still matches the file" "printf '%s' \"\$out\" | grep -q 'you edited: tools/x.ts'"
+out=$(pj bbbb2222 Edit "{\"file_path\":\"$er/src/auth/token.ts\"}" | "$AL" hook claude-code | ctx)
+check "edits: your own claim never warns you" "! printf '%s' \"\$out\" | grep -q 'you edited'"
+out=$(pj gggg7777 Edit "{\"file_path\":\"$er/src/authz.ts\"}" | "$AL" hook codex | ctx)
+check "edits: a directory claim does not match a sibling prefix" "! printf '%s' \"\$out\" | grep -q 'you edited'"
+check "edits: nudges are tracked per session" "grep -q . \"$AGENTLOG_DIR/nudged/aaaa1111\""
+
+# --- presence: hooked sessions that go quiet stop holding claims; SessionEnd releases
+fresh presence
+hj aaaa1111 SessionStart | "$AL" hook claude-code >/dev/null
+run claude-code aaaa1111 write -k claim -p 'src/' "hooked claim" >/dev/null 2>&1
+run human hhhh0000 write -k claim -p 'docs/' "human claim, no hooks" >/dev/null 2>&1
+check "presence: hook marks the session via=hook (kept by later CLI writes)" "grep -qx via=hook \"$AGENTLOG_DIR/sessions/aaaa1111\""
+check "presence: the CLI alone never marks via=hook" "! grep -qx via=hook \"$AGENTLOG_DIR/sessions/hhhh0000\""
+touch -t 202001010000 "$AGENTLOG_DIR/sessions/aaaa1111" "$AGENTLOG_DIR/sessions/hhhh0000"
+cl=$(run x xxxx9999 claims)
+check "presence: a stale hooked session's claims stop counting" "! printf '%s' \"\$cl\" | grep -q 'src/'"
+check "presence: claims of sessions without hooks keep their lease" "printf '%s' \"\$cl\" | grep -q 'docs/'"
+hj aaaa1111 PostToolUse | "$AL" hook claude-code >/dev/null
+check "presence: a tool call revives the session and its claims" "run x xxxx9999 claims | grep -q 'src/'"
+hj aaaa1111 SessionEnd | "$AL" hook claude-code >/dev/null
+check "presence: SessionEnd releases the session's claims" "! run x xxxx9999 claims | grep -q 'src/'"
+check "presence: SessionEnd drops the presence file" "[ ! -e \"$AGENTLOG_DIR/sessions/aaaa1111\" ]"
+n=$(find "$AGENTLOG_DIR/msgs" -type f | wc -l)
+hj aaaa1111 SessionEnd | "$AL" hook claude-code >/dev/null
+check "presence: SessionEnd with nothing held posts nothing" "[ \"\$(find \"$AGENTLOG_DIR/msgs\" -type f | wc -l)\" -eq $n ]"
+
 # --- identity from agent env vars
 fresh ident
 check "identity: Claude Code env" "[ \"\$(CLAUDE_CODE_SESSION_ID=abc123456789 \"$AL\" whoami)\" = 'claude-code:abc12345 (session abc123456789)' ]"
@@ -326,8 +381,8 @@ check "harden: gc only deletes agentlog's own files" "[ -f \"$victim/tmp/keep\" 
 # --- plugin: manifests point at real files; every hook runs this script for its agent
 pl=$here
 hook_cmds_ok() { # hook_cmds_ok HOOKS-JSON AGENT
-  jq -e '.hooks | has("SessionStart") and has("UserPromptSubmit") and has("PostToolUse")' "$1" >/dev/null || return 1
-  [ "$(jq '[.. | .command? // empty] | length' "$1")" -ge 3 ] || return 1
+  jq -e '.hooks | has("SessionStart") and has("UserPromptSubmit") and has("PostToolUse") and has("SessionEnd")' "$1" >/dev/null || return 1
+  [ "$(jq '[.. | .command? // empty] | length' "$1")" -ge 4 ] || return 1
   jq -r '.. | .command? // empty' "$1" | while IFS= read -r c; do
     p=$(printf '%s\n' "$c" | sed -n 's/^"\([^"]*\)".*/\1/p' | sed "s|\${CLAUDE_PLUGIN_ROOT}|$pl|")
     [ "$p" = "$pl/bin/agentlog" ] && [ -x "$p" ] || exit 1
@@ -340,7 +395,7 @@ for m in claude:.claude-plugin/plugin.json:claude-code codex:.codex-plugin/plugi
   check "plugin: $n hooks run bin/agentlog hook $a" "hook_cmds_ok \"$pl/\$(jq -r .hooks \"$pl/$f\")\" $a"
 done
 muse_hooks_ok() { # every Muse hook runs its own wrapper, which runs bin/agentlog hook muse
-  [ "$(jq '.capabilities.hooks | length' "$pl/.muse-plugin/plugin.json")" -eq 3 ] || return 1
+  [ "$(jq '.capabilities.hooks | length' "$pl/.muse-plugin/plugin.json")" -eq 4 ] || return 1
   jq -r '.capabilities.hooks[] | .command[1]' "$pl/.muse-plugin/plugin.json" | while IFS= read -r w; do
     [ -f "$pl/$w" ] && [ ! -L "$pl/$w" ] && grep -q 'bin/agentlog" hook muse$' "$pl/$w" || exit 1
   done

@@ -8,6 +8,9 @@
     ],
     "PostToolUse": [
       { "matcher": "*", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/agentlog\" hook claude-code" }] }
+    ],
+    "SessionEnd": [
+      { "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/agentlog\" hook claude-code" }] }
     ]
   }
 }

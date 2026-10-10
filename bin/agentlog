@@ -20,7 +20,7 @@ PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:/home/linuxb
 export PATH
 unset _v _keep
 
-VERSION=0.4.2
+VERSION=0.5.0
 # Resolve our own path now: hooks may cd into the workspace later, which
 # would break a relative $0 such as Antigravity's ./bin/agentlog.
 SELF=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
@@ -185,12 +185,32 @@ detect_identity() {
 worktree() { git rev-parse --show-toplevel 2>/dev/null || pwd; }
 branch() { git symbolic-ref --short -q HEAD 2>/dev/null || git rev-parse --short HEAD 2>/dev/null || echo -; }
 
+# Presence: one file per session, rewritten on each prompt (and every few
+# minutes of tool calls). via=hook marks sessions whose agent runs our hooks;
+# only their claims lapse when the presence goes stale (see stale_owners).
 touch_presence() {
   [ -n "$W" ] || return 0
+  _via=${HOOKED:-}
+  [ -z "$_via" ] && grep -qsx 'via=hook' "$W/sessions/$SESSION" "$STORE/sessions/$SESSION" && _via=1
   {
     printf 'agent=%s\nsession=%s\nbranch=%s\nworktree=%s\nseen=%s\n' \
       "$AGENT" "$SESSION" "$(branch)" "$(worktree)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    [ -n "$_via" ] && printf 'via=hook\n'
   } | atomic_write "$W/sessions/$SESSION"
+}
+
+# Minutes without presence after which a hooked session counts as gone.
+STALE_MIN=60
+
+# Space-separated ids of hooked sessions not seen for STALE_MIN minutes in
+# any store. Their claims stop counting: the agent most likely exited without
+# a SessionEnd hook (crash, closed terminal, an agent that has none).
+stale_owners() {
+  stores | while IFS= read -r st; do
+    [ -d "$st/sessions" ] && find "$st/sessions" -maxdepth 1 -type f -mmin -"$STALE_MIN" 2>/dev/null | sed 's|.*/|fresh |'
+    [ -d "$st/sessions" ] && find "$st/sessions" -maxdepth 1 -type f -mmin +"$STALE_MIN" -exec grep -lx 'via=hook' {} + 2>/dev/null | sed 's|.*/|old |'
+  done | awk '$1 == "fresh" { f[$2] = 1 } $1 == "old" { o[$2] = 1 }
+    END { printf " "; for (s in o) if (!(s in f)) printf "%s ", s; print "" }'
 }
 
 # ---------------------------------------------------------------- index
@@ -215,13 +235,14 @@ index() {
   ' /dev/null | sort | awk -F '\t' '!seen[$1]++' # /dev/null: never read stdin
 }
 
-# Active claims (TSV, same columns). A claim ends when it expires, or when its
-# owner posts release/done after it:
+# Active claims (TSV, same columns). A claim ends when it expires, when its
+# owner's session goes stale (stale_owners), or when its owner posts
+# release/done after it:
 #  - with Re: <claim id>, closing that claim;
 #  - with Paths but no Re, closing that session's claims whose paths it lists;
 #  - with neither, closing everything that session claimed before it.
 active_claims() {
-  index | awk -F '\t' -v now="$(now_epoch)" '
+  index | awk -F '\t' -v now="$(now_epoch)" -v stale="$(stale_owners)" '
     # Every path of the claim appears in the closing message (space or comma lists).
     function covers(cp, ep,   c, e, set, i, nc, ne) {
       nc = split(cp, c, /[ ,]+/); ne = split(ep, e, /[ ,]+/)
@@ -245,6 +266,7 @@ active_claims() {
       for (i = 1; i <= NR; i++) {
         if (!claim[i]) continue
         if (expv[i] != "" && expv[i] + 0 <= now) continue
+        if (index(stale, " " sess[i] " ")) continue
         if (closed[name[i]]) continue
         if ((sess[i] in relall) && relall[sess[i]] > name[i]) continue
         if (ended_by_paths(i)) continue
@@ -570,6 +592,7 @@ cmd_gc() {
     find "$st/msgs" -maxdepth 1 -type f -name '2[0-9]*T*Z-*.msg' -mtime +"$days" -exec rm -f {} + 2>/dev/null || :
     find "$st/sessions" -maxdepth 1 -type f -mtime +"$days" -exec grep -l '^agent=' {} + 2>/dev/null |
       tr '\n' '\0' | xargs -0 rm -f
+    [ -d "$st/nudged" ] && find "$st/nudged" -maxdepth 1 -type f -mtime +"$days" -exec rm -f {} + 2>/dev/null
     find "$st/tmp" "$st/msgs" "$st/seen" "$st/sessions" -maxdepth 1 -type f \
       \( -name '.w.*' -o -name '.probe.*' \) -mmin +60 -exec rm -f {} + 2>/dev/null || :
   done
@@ -603,6 +626,91 @@ json_str() {
   printf '%s' "$1" | tr -d '\000-\010\013\014\016-\037' |
     sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e "s/$(printf '\t')/\\\\t/g" -e "s/$(printf '\r')//g" |
     awk 'BEGIN { ORS = ""; print "\"" } NR > 1 { print "\\n" } { print } END { print "\"" }'
+}
+
+# Files a PostToolUse payload says the tool edited, one per line, relative to
+# the repo root. Covers Claude/Muse style tool_input fields (file_path,
+# notebook_path, path) and apply_patch text (Codex), wherever it sits.
+# Read-only tools are skipped so reading a claimed file stays silent.
+edited_paths() { # edited_paths JSON
+  case $(printf '%s' "$1" | json_field tool_name) in
+    *[Rr]ead* | *[Gg]rep* | *[Gg]lob* | LS | *[Ss]earch* | *[Ll]ist* | *[Vv]iew* | *[Ff]etch*) return 0 ;;
+  esac
+  if command -v jq >/dev/null 2>&1; then
+    ti=$(printf '%s' "$1" | jq -c '.tool_input // empty' 2>/dev/null) || ti=''
+  else
+    # No jq: drop everything from tool_response on, which echoes file contents.
+    ti=$(printf '%s' "$1" | tr -d '\n' | awk '{ i = index($0, "\"tool_response\""); if (i) $0 = substr($0, 1, i - 1); print }')
+  fi
+  [ -n "$ti" ] || return 0
+  root=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
+  prefix=$(git rev-parse --show-prefix 2>/dev/null) || prefix=''
+  lroot=$(pwd) && [ -n "$prefix" ] && lroot=${lroot%/"${prefix%/}"}
+  printf '%s\n' "$ti" | awk '
+    function emit(p) { gsub(/^[ \t]+|[ \t]+$/, "", p); gsub(/\/\/+/, "/", p); if (p != "") print p }
+    {
+      s = $0
+      while (match(s, /"(file_path|notebook_path|path)"[ \t]*:[ \t]*"[^"]*"/)) {
+        m = substr(s, RSTART, RLENGTH); s = substr(s, RSTART + RLENGTH)
+        sub(/^"[a-z_]*"[ \t]*:[ \t]*"/, "", m); sub(/"$/, "", m); emit(m)
+      }
+      s = $0
+      while (match(s, /\*\*\* (Update File|Add File|Delete File|Move to): [^"\\]*/)) {
+        m = substr(s, RSTART, RLENGTH); s = substr(s, RSTART + RLENGTH)
+        sub(/^[^:]*: /, "", m); emit(m)
+      }
+    }' | while IFS= read -r p; do
+    case $p in
+      /*)
+        # git reports the physical root (/private/var on macOS); match it.
+        _d=$(cd "${p%/*}/" 2>/dev/null && pwd -P) && p=$_d/${p##*/}
+        case $p in
+          "$root"/*) printf '%s\n' "${p#"$root"/}" ;;
+          "$lroot"/*) printf '%s\n' "${p#"$lroot"/}" ;;
+        esac ;;
+      *) printf '%s%s\n' "$prefix" "${p#./}" ;;
+    esac
+  done | sort -u
+}
+
+# Does FILE fall under claim path PAT? PAT is a file, a directory (with or
+# without a trailing /) or a glob where * also crosses /. Agents sometimes
+# add ":symbol" to a path; the part before the colon counts too.
+path_in_claim() { # path_in_claim FILE PAT
+  for _p in "$2" "${2%%:*}"; do
+    _p=${_p#./}
+    [ -n "$_p" ] || continue
+    case $1 in "$_p" | "${_p%/}"/*) return 0 ;; esac
+    # shellcheck disable=SC2254 # the claim path is a glob on purpose
+    case $_p in *[*?[]*) case $1 in $_p) return 0 ;; esac ;; esac
+  done
+  return 1
+}
+
+# Warning text for edits to FILES (newline-separated) that fall inside other
+# sessions' active claims. Each claim warns a session once (nudged/<session>).
+claim_warnings() { # claim_warnings FILES
+  claims=$(active_claims | awk -F '\t' -v me="$SESSION" '$4 != me')
+  [ -n "$claims" ] || return 0
+  nudged=$W/nudged/$SESSION
+  tab=$(printf '\t')
+  hits=$(set -f; printf '%s\n' "$claims" | cut -f1,8 | while IFS=$tab read -r id cpaths; do
+    grep -qsx "$id" "$nudged" && continue
+    for pat in $(printf '%s' "$cpaths" | tr ',' ' '); do
+      hit=$(printf '%s\n' "$1" | while IFS= read -r f; do
+        if path_in_claim "$f" "$pat"; then printf '%s\n' "$f"; break; fi
+      done)
+      if [ -n "$hit" ]; then printf '%s\t%s\n' "$id" "$hit"; break; fi
+    done
+  done)
+  [ -n "$hits" ] || return 0
+  mkdir -p "$W/nudged" 2>/dev/null || :
+  printf '%s\n' "$hits" | cut -f1 >>"$nudged" 2>/dev/null || :
+  printf '%s\n' "agentlog: you just edited files inside another session's active claim. Check with its owner before going further (write -k request -t <session> ...), or leave the files alone."
+  printf '%s\n' "$hits" | while IFS=$tab read -r id f; do
+    printf '%s\n' "$claims" | awk -F '\t' -v id="$id" '$1 == id' | fmt_claims
+    printf '    you edited: %s\n' "$f"
+  done
 }
 
 # ---------------------------------------------------------------- install
@@ -787,10 +895,28 @@ cmd_hook() {
   ensure_store
   [ -n "$W" ] || exit 0
 
+  HOOKED=1
   case $event in
     SessionStart | UserPromptSubmit) touch_presence ;;
+    SessionEnd)
+      # Release whatever this session still holds and drop its presence.
+      if active_claims | awk -F '\t' -v me="$SESSION" '$4 == me { f = 1 } END { exit !f }'; then
+        cmd_write -k release "session ended" >/dev/null 2>&1 || :
+      fi
+      rm -f "$STORE/sessions/$SESSION" ${LOCAL:+"$LOCAL/sessions/$SESSION"} 2>/dev/null || :
+      exit 0
+      ;;
+    *)
+      # Tool calls keep presence fresh too, at most every few minutes.
+      [ -n "$(find "$W/sessions/$SESSION" -mmin -5 2>/dev/null)" ] || touch_presence
+      ;;
   esac
-  if [ "$event" != SessionStart ]; then
+  warn=''
+  if [ "$event" = PostToolUse ]; then
+    files=$(edited_paths "$input")
+    [ -n "$files" ] && warn=$(claim_warnings "$files")
+  fi
+  if [ "$event" != SessionStart ] && [ -z "$warn" ]; then
     cursor=$W/seen/$SESSION
     [ -f "$STORE/seen/$SESSION" ] && cursor=$STORE/seen/$SESSION
     if [ -f "$cursor" ]; then
@@ -824,7 +950,10 @@ Unread messages:
 $unread"
       ;;
     *)
-      [ -n "$unread" ] && ctx="agentlog: new messages from other agents in this repo (you are $AGENT:$SHORT; command: $al). Act on requests addressed to you; reply with \`$al write -k reply -r <id> ...\`.
+      ctx=$warn
+      [ -n "$unread" ] && ctx="${ctx:+$ctx
+
+}agentlog: new messages from other agents in this repo (you are $AGENT:$SHORT; command: $al). Act on requests addressed to you; reply with \`$al write -k reply -r <id> ...\`.
 $unread"
       ;;
   esac

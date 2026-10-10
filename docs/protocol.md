@@ -29,6 +29,7 @@ It deliberately does **not** live inside `.git/`: Codex's sandbox mounts `.git` 
   .agentlog-store                      marker; gc and migration only touch marked stores
   seen/<session>                       message ids this session has read
   sessions/<session>                   presence: agent, branch, worktree, last seen
+  nudged/<session>                     claim ids this session was warned about
 ```
 
 ## Atomicity
@@ -79,10 +80,15 @@ Claims are advisory leases. A claim stops being active when the first of these h
 - its owner posts `done` or `release` with `Re: <claim id>`;
 - its owner posts `done` or `release` with `Paths` but no `Re`, which closes that session's earlier claims whose paths all appear in the list (space- or comma-separated);
 - its owner posts a bare `done` or `release` (no `Re`, no `Paths`), which closes everything that session claimed before.
+- its owner's session goes stale: the session's presence record (`sessions/<id>`) says `via=hook` and hasn't been refreshed for 60 minutes. Hooks refresh it on every prompt and at most every 5 minutes of tool calls, so this only happens when an agent exited without its SessionEnd hook (crash, killed terminal) or sat idle that long. The claim comes back if the session wakes up before the claim expires. Sessions that never ran a hook (a person, a script, an agent without hooks) keep their claims until expiry or `done`/`release`.
+
+When a session ends, its SessionEnd hook (Claude Code, Codex, Muse) posts a bare `release` ("session ended") if the session still holds any claims, then removes its presence record. Not every agent fires SessionEnd in every mode (`codex exec` doesn't); the staleness rule covers those.
 
 Prefer `-r <claim id>`: it says exactly which claim the message finishes.
 
 `agentlog write -k claim` prints the other active claims so the agent can check for overlap.
+
+After an edit tool call, the PostToolUse hook checks the edited files against other sessions' active claims and, on a match, injects a warning naming the claim, its owner and the file. Edited files come from `tool_input` (`file_path`, `notebook_path`, `path`) and from `apply_patch` text (`*** Update File:`, `*** Add File:`, `*** Delete File:`, `*** Move to:`); read-only tools are skipped. A claim path matches a file when it equals the file, is a directory containing it, or is a glob matching it (`*` crosses `/`); in a `file:symbols` claim the file part counts. Each claim warns a given session once, tracked in `nudged/<session>` (removed by `gc`).
 
 ## Identity
 
@@ -95,7 +101,7 @@ Because every message carries the full session id, a reader can follow up throug
 ## Hooks
 
 The plugin provides the skill and the hooks. Nothing needs to be copied into individual repos.
-- **Claude Code, Codex, Muse:** `SessionStart`, `UserPromptSubmit` and `PostToolUse`, with Claude-style JSON in and `hookSpecificOutput.additionalContext` out.
+- **Claude Code, Codex, Muse:** `SessionStart`, `UserPromptSubmit`, `PostToolUse` and `SessionEnd`, with Claude-style JSON in and `hookSpecificOutput.additionalContext` out.
 - **Antigravity:** `SessionStart` and `PreInvocation`, which runs before every model call. Its hooks can't inject context after a tool call, but the next model call picks up anything new. Messages arrive as ephemeral messages (`injectSteps`), visible to that model call.
 
 The hooks are cheap and quiet:

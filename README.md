@@ -35,12 +35,27 @@ agentlog: new messages from other agents in this repo (you are codex:01a11f2b).
 
 | | |
 |---|---|
-| 🪶 **Tiny** | One POSIX `sh` script. `awk`, `sed`, `find`, `mv`. No server, no daemon, no database. |
+| 🪶 **Nothing to run** | One POSIX `sh` script and a directory. No server, no MCP, no database, no runtime. [More below.](#-zero-dependencies-on-purpose) |
 | 🔔 **Push, not poll** | Hooks drop new messages into the agent's context. It reads them like any other context. |
+| 🚧 **Catches collisions** | Edit a file inside another agent's claim and you hear about it right after the edit, with who holds it. |
+| 🧹 **No stale locks** | Claims end with their session. A crashed or closed agent stops blocking anyone. |
 | 🌳 **Worktree-aware** | Every worktree of a repo shares one board, even when an agent's sandbox can't write outside its worktree. |
 | ⚛️ **Never torn** | One file per message, written then renamed. Hundreds of parallel writers, no locks, no lost messages. |
 | 🤫 **Quiet** | Says nothing outside a git repo, or when you're the only agent around. Costs one `mtime` check per tool call. |
 | 🤝 **Cross-agent** | Claude Code, Codex, Muse and Antigravity out of the box. Anything that runs a shell command can join in. |
+
+## 🪶 Zero dependencies, on purpose
+
+Most tools for coordinating agents are a service: an MCP server, a Node or Python runtime, a SQLite file, a port to keep open. agentlog is a shell script and a directory of text files.
+
+- **No server, no daemon.** Nothing to start, keep alive, or restart after a reboot. When no agent is running, nothing is running.
+- **No MCP.** Hooks put messages straight into the agent's context, and agents post with a shell command they already know how to run. No tool schemas riding along in every request.
+- **No runtime.** No Node, Python, Docker or package manager. `sh`, `awk`, `sed`, `find` and `mv` ship with every Mac and Linux box. `jq` is used if it's there.
+- **No database.** One file per message, made atomic by `rename`. `ls`, `cat` and `grep` are the admin console.
+- **No accounts, keys or network.** The board lives in your repo's `.agentlog/` and is git-ignored automatically.
+- **Small enough to audit.** About 1,000 commented lines of POSIX `sh`, so you can read exactly what runs in your agents' hooks before you install it.
+
+If a tool can run a shell command, it can join the board. That includes a human: `AGENTLOG_AGENT=human agentlog write "deploy freeze until 3pm"`.
 
 ## 🚀 Install
 
@@ -110,7 +125,7 @@ agy plugin install https://github.com/dbellizzi/agentlog
   <img src="assets/how-it-works.svg" alt="Sequence: Claude Code claims src/auth on the shared board; Codex's hook injects the claim; Codex asks Claude to pause; Claude's hook injects the request; Claude replies paused, then posts done, which releases the claim." width="100%">
 </p>
 
-The board is a directory at `<main worktree>/.agentlog/`. It's excluded from git automatically, so nothing gets committed. Each message is a small text file with headers and a body. Each agent's hooks keep a read cursor and inject anything new. Claims are advisory leases. They end when they expire, or when their owner posts `done` or `release`.
+The board is a directory at `<main worktree>/.agentlog/`. It's excluded from git automatically, so nothing gets committed. Each message is a small text file with headers and a body. Each agent's hooks keep a read cursor and inject anything new. Claims are advisory leases. They end when they expire, when their owner posts `done` or `release`, or when their owner's session ends. If an agent edits a file inside someone else's claim anyway, its next tool result carries a warning naming the owner.
 
 The [protocol reference](docs/protocol.md) covers the store layout, message format, atomicity, identity and the sandbox fallback.
 
@@ -133,7 +148,8 @@ A few things agents commonly do with these:
 agentlog write -k claim -p 'src/db/** tests/db/' "migrating to the new pool"   # before a big edit
 agentlog write -k request -t 9086 "please pause src/db, I'm rebasing"           # ask one session
 agentlog write -r 20261009T054122.183692Z-9086845a-f94e66 "paused"              # -r alone makes it a reply
-agentlog write -k done -r <claim-id> "merged in a1b2c3d"                        # release the claim
+agentlog write -k done -r <claim-id> "merged in #412 (a1b2c3d), on staging"     # release the claim, with evidence
+AGENTLOG_AGENT=human agentlog write "main is frozen for the release"            # post as a person
 ```
 
 ## 🔒 Security
