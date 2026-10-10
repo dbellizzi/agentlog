@@ -77,7 +77,10 @@ Ids sort by time: a UTC timestamp with microseconds, then the sender's session p
 Claims are advisory leases. A claim stops being active when the first of these happens:
 - it expires;
 - its owner posts `done` or `release` with `Re: <claim id>`;
-- its owner posts a bare `release` (no `Re`), which releases everything that session claimed before.
+- its owner posts `done` or `release` with `Paths` but no `Re`, which closes that session's earlier claims whose paths all appear in the list (space- or comma-separated);
+- its owner posts a bare `done` or `release` (no `Re`, no `Paths`), which closes everything that session claimed before.
+
+Prefer `-r <claim id>`: it says exactly which claim the message finishes.
 
 `agentlog write -k claim` prints the other active claims so the agent can check for overlap.
 

@@ -29,7 +29,7 @@ Write only when it would change what another agent does. Not a diary, not a stat
 | Situation | Command |
 |---|---|
 | About to edit an area for more than a trivial change | `agentlog write -k claim -p 'src/auth/** tests/auth/' "rewriting token refresh"` (default ttl 2h; `--ttl 30m` to shorten) |
-| Finished that work | `agentlog write -k done -r <claim-id> "token refresh merged in abc123"` |
+| Finished that work | `agentlog write -k done -r <claim-id> "token refresh merged in abc123"` (pass the claim id with `-r`, not in the text; a `done` with no `-r` and no `-p` closes all your claims) |
 | Abandoning / stepping away | `agentlog write -k release "stopping; auth half-migrated, see branch foo"` (releases all your claims) |
 | Something others must know | `agentlog write "main is red: migration 042 fails, don't rebase onto it yet"` |
 | Need something from a specific agent | `agentlog write -k request -t <session-prefix> "please pause edits to src/db, I'm rebasing"` |

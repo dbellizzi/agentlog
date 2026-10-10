@@ -129,6 +129,30 @@ run b bbbb2222 write -k release "stepping away" >/dev/null
 check "claims: bare release closes all of a session" "[ -z \"\$(run a aaaa1111 claims)\" ]"
 check "claims: claim requires paths" "! run a aaaa1111 write -k claim nope 2>/dev/null"
 check "claims: overlap warning on stderr" "run a aaaa1111 write -k claim -p x 'x' >/dev/null 2>&1; run b bbbb2222 write -k claim -p y 'y' 2>&1 >/dev/null | grep -q 'other active claims'"
+
+# --- claims: closing without Re (by paths, or everything)
+fresh claims-close
+run a aaaa1111 write -k claim -p 'src/a/** src/b.ts' "a and b" >/dev/null 2>&1
+run a aaaa1111 write -k claim -p 'docs/' "docs" >/dev/null 2>&1
+run b bbbb2222 write -k claim -p 'src/a/**' "b also on a" >/dev/null 2>&1
+run a aaaa1111 write -k done -p 'src/b.ts' "only b finished" >/dev/null
+cl=$(run a aaaa1111 claims)
+check "claims: done -p leaves a claim it only partly covers" "printf '%s' \"\$cl\" | grep -q 'src/a/\*\* src/b.ts'"
+run a aaaa1111 write -k done -p 'src/b.ts,src/a/**' "a and b finished" >/dev/null
+cl=$(run a aaaa1111 claims)
+check "claims: done -p closes own claims it covers (comma list)" "! printf '%s' \"\$cl\" | grep -q 'src/b.ts'"
+check "claims: done -p leaves other claims of the session" "printf '%s' \"\$cl\" | grep -q 'docs/'"
+check "claims: done -p never closes another session's claim" "printf '%s' \"\$cl\" | grep -q 'bbbb2222'"
+run a aaaa1111 write -k claim -p 'later/' "claimed after" >/dev/null 2>&1
+sleep 1
+run a aaaa1111 write -k done "all done" >/dev/null
+run a aaaa1111 write -k claim -p 'next/' "claimed after done" >/dev/null 2>&1
+cl=$(run a aaaa1111 claims)
+check "claims: bare done closes the session's earlier claims" "! printf '%s' \"\$cl\" | grep -q -e 'docs/' -e 'later/'"
+check "claims: bare done keeps later claims" "printf '%s' \"\$cl\" | grep -q 'next/'"
+check "claims: bare done never closes another session's claim" "printf '%s' \"\$cl\" | grep -q 'bbbb2222'"
+run b bbbb2222 write -k release -p 'elsewhere/' "not this one" >/dev/null
+check "claims: release -p with unrelated paths closes nothing" "run a aaaa1111 claims | grep -q 'bbbb2222'"
 : "$c3"
 
 # --- hook: valid JSON, silent when nothing new, identity from stdin

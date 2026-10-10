@@ -20,7 +20,7 @@ PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:/home/linuxb
 export PATH
 unset _v _keep
 
-VERSION=0.4.1
+VERSION=0.4.2
 # Resolve our own path now: hooks may cd into the workspace later, which
 # would break a relative $0 such as Antigravity's ./bin/agentlog.
 SELF=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
@@ -215,22 +215,39 @@ index() {
   ' /dev/null | sort | awk -F '\t' '!seen[$1]++' # /dev/null: never read stdin
 }
 
-# Active claims (TSV, same columns). A claim ends when it expires, when its
-# owner posts release/done with Re: <claim id>, or when its owner posts a bare
-# `release` (releases everything that session claimed before it).
+# Active claims (TSV, same columns). A claim ends when it expires, or when its
+# owner posts release/done after it:
+#  - with Re: <claim id>, closing that claim;
+#  - with Paths but no Re, closing that session's claims whose paths it lists;
+#  - with neither, closing everything that session claimed before it.
 active_claims() {
   index | awk -F '\t' -v now="$(now_epoch)" '
-    { name[NR] = $1; line[NR] = $0 }
+    # Every path of the claim appears in the closing message (space or comma lists).
+    function covers(cp, ep,   c, e, set, i, nc, ne) {
+      nc = split(cp, c, /[ ,]+/); ne = split(ep, e, /[ ,]+/)
+      for (i = 1; i <= ne; i++) if (e[i] != "") set[e[i]] = 1
+      for (i = 1; i <= nc; i++) if (c[i] != "" && !(c[i] in set)) return 0
+      return 1
+    }
+    function ended_by_paths(i,   j) {
+      for (j = 1; j <= n_end; j++)
+        if (end_sess[j] == sess[i] && end_name[j] > name[i] && covers(paths[i], end_paths[j])) return 1
+      return 0
+    }
+    { name[NR] = $1; sess[NR] = $4; expv[NR] = $7; paths[NR] = $8; line[NR] = $0 }
     $2 == "claim" { claim[NR] = 1 }
     ($2 == "release" || $2 == "done") && $6 != "" { closed[$6] = 1 }
-    $2 == "release" && $6 == "" { relall[$4] = $1 }
-    { sess[NR] = $4; expv[NR] = $7 }
+    ($2 == "release" || $2 == "done") && $6 == "" {
+      if ($8 == "") relall[$4] = $1
+      else { n_end++; end_sess[n_end] = $4; end_name[n_end] = $1; end_paths[n_end] = $8 }
+    }
     END {
       for (i = 1; i <= NR; i++) {
         if (!claim[i]) continue
         if (expv[i] != "" && expv[i] + 0 <= now) continue
         if (closed[name[i]]) continue
         if ((sess[i] in relall) && relall[sess[i]] > name[i]) continue
+        if (ended_by_paths(i)) continue
         print line[i]
       }
     }'
@@ -796,7 +813,7 @@ cmd_hook() {
       done | head -1)
       [ -n "$others$claims$unread" ] || exit 0
       ctx="agentlog: other agents are working in this repo. You are $AGENT:$SHORT (session $SESSION).
-Use the agentlog skill. Command: $al (e.g. \`$al write -k claim -p 'src/foo/**' \"refactoring foo\"\`). Claim before larger edits, post done, reply to requests addressed to you."
+Use the agentlog skill. Command: $al (e.g. \`$al write -k claim -p 'src/foo/**' \"refactoring foo\"\`). Claim before larger edits; when finished, post \`done -r <claim-id>\`; reply to requests addressed to you."
       [ -n "$claims" ] && ctx="$ctx
 
 Active claims:
