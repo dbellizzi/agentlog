@@ -92,7 +92,7 @@ run codex bbbb2222 write -k reply -r "$c" -t aaaa "plain reply" >/dev/null
 out=$(run claude-code aaaa1111 read --json --peek)
 check "json: one line per message" "[ \$(printf '%s\n' \"\$out\" | wc -l) -eq 2 ]"
 check "json: every line parses" "printf '%s\n' \"\$out\" | jq -e . >/dev/null"
-check "json: all fields present" "printf '%s\n' \"\$out\" | head -1 | jq -e 'keys == ([\"agent\",\"body\",\"branch\",\"date\",\"expires\",\"id\",\"kind\",\"paths\",\"re\",\"session\",\"to\"] | sort)' >/dev/null"
+check "json: all fields present" "printf '%s\n' \"\$out\" | head -1 | jq -e 'keys == ([\"agent\",\"body\",\"branch\",\"date\",\"expires\",\"host\",\"id\",\"kind\",\"paths\",\"re\",\"session\",\"to\"] | sort)' >/dev/null"
 check "json: claim fields and escaped body" "printf '%s\n' \"\$out\" | head -1 | jq -e --arg c \"$c\" '.id == \$c and .kind == \"claim\" and .paths == \"src/**\" and .agent == \"codex\" and .session == \"bbbb2222\" and .re == null and (.expires | type) == \"number\" and .body == \"claim \\\"quoted\\\" \\\\ back\\ttab\\nsecond line\"' >/dev/null"
 check "json: reply fields" "printf '%s\n' \"\$out\" | tail -1 | jq -e --arg c \"$c\" '.re == \$c and .to == \"aaaa\" and .paths == null and .expires == null and .body == \"plain reply\"' >/dev/null"
 check "json: -n notice goes to stderr" "[ \$(run claude-code aaaa1111 read --json -n 1 2>/dev/null | jq -c . | wc -l) -eq 1 ] && run claude-code aaaa1111 read --all --json -n 1 2>&1 >/dev/null | grep -q 'not shown'"
@@ -241,10 +241,62 @@ hj aaaa1111 PostToolUse | "$AL" hook claude-code >/dev/null
 check "presence: a tool call revives the session and its claims" "run x xxxx9999 claims | grep -q 'src/'"
 hj aaaa1111 SessionEnd | "$AL" hook claude-code >/dev/null
 check "presence: SessionEnd releases the session's claims" "! run x xxxx9999 claims | grep -q 'src/'"
-check "presence: SessionEnd drops the presence file" "[ ! -e \"$AGENTLOG_DIR/sessions/aaaa1111\" ]"
+check "presence: SessionEnd marks the presence ended" "grep -q '^ended=' \"$AGENTLOG_DIR/sessions/aaaa1111\" && ! run x xxxx9999 who | grep -q aaaa1111"
 n=$(find "$AGENTLOG_DIR/msgs" -type f | wc -l)
 hj aaaa1111 SessionEnd | "$AL" hook claude-code >/dev/null
 check "presence: SessionEnd with nothing held posts nothing" "[ \"\$(find \"$AGENTLOG_DIR/msgs\" -type f | wc -l)\" -eq $n ]"
+
+# --- sync: two "machines" (own HOME, store and clone) share a board through a remote
+fresh sync
+rem=$root/remote
+for m in m1 m2; do
+  mkdir -p "$root/$m/home/.config/agentlog"
+  printf 'host=%s\nremote=%s\n' "$m" "$rem" >"$root/$m/home/.config/agentlog/config"
+  git init -q "$root/$m/repo"
+  git -C "$root/$m/repo" remote add origin "git@GitHub.com:Owner/Repo.git"
+done
+on() { _m=$1; shift; (cd "$root/$_m/repo" && HOME=$root/$_m/home AGENTLOG_DIR=$root/$_m/store AGENTLOG_NO_INSTALL=1 "$@"); }
+check "sync: dir names the remote board from the origin URL" "on m1 run codex aaaa1111 dir | grep -qx 'synced with $rem/github.com/owner/repo'"
+for u in https://github.com/owner/repo.git ssh://git@github.com:22/owner/repo git@github.com:owner/repo/; do
+  git -C "$root/m2/repo" remote set-url origin "$u"
+  check "sync: repo key from $u" "on m2 run codex aaaa1111 dir | grep -q 'github.com/owner/repo\$'"
+done
+on m1 run claude-code aaaa1111 write -k claim -p 'src/**' "m1 claim" >/dev/null 2>&1
+on m1 run claude-code aaaa1111 sync --quiet
+on m2 run codex bbbb2222 sync --quiet
+check "sync: a claim crosses machines" "on m2 run codex bbbb2222 claims | grep -q 'claude-code:aaaa1111 on m1  src/\*\*'"
+check "sync: presence crosses machines" "on m2 run codex bbbb2222 who | grep -q 'aaaa1111 on m1'"
+check "sync: messages carry Host" "grep -qx 'Host: m1' \"$rem\"/github.com/owner/repo/msgs/*.msg"
+check "sync: read cursors stay local" "[ ! -d \"$rem/github.com/owner/repo/seen\" ]"
+on m1 run claude-code aaaa1111 read >/dev/null
+on m2 run codex bbbb2222 write -k request -t aaaa1111 "from m2" >/dev/null
+f=$(find "$root/m2/store/msgs" -name '*bbbb2222*' | head -1)
+touch -t 202001010000 "$f" # an old mtime, as if it reached the remote late
+on m2 run codex bbbb2222 sync --quiet
+printf '{"session_id":"aaaa1111","hook_event_name":"PostToolUse","cwd":"%s"}' "$root/m1/repo" >"$root/sync-hook.json"
+check "sync: hooks don't sync again within 10s when nothing was written here" "on m1 \"$AL\" hook claude-code <\"$root/sync-hook.json\" >/dev/null; sleep 1; [ -z \"\$(find \"$root/m1/store/msgs\" -name '*bbbb2222*')\" ]"
+rm -f "$root/m1/store/.sync-at" # as if 10s had passed
+on m1 "$AL" hook claude-code <"$root/sync-hook.json" >/dev/null
+i=0; while [ $i -lt 50 ] && [ -z "$(find "$root/m1/store/msgs" -name '*bbbb2222*')" ]; do sleep 0.1; i=$((i + 1)); done
+check "sync: a hook starts a background sync that pulls new messages" "[ -n \"\$(find \"$root/m1/store/msgs\" -name '*bbbb2222*')\" ]"
+i=0; while [ $i -lt 50 ] && [ -d "$root/m1/store/.sync.lock" ]; do sleep 0.1; i=$((i + 1)); done
+out=$(on m1 "$AL" hook claude-code <"$root/sync-hook.json")
+check "sync: a pulled message gets a fresh mtime, so the next hook delivers it" "printf '%s' \"\$out\" | grep -q 'from m2'"
+check "sync: hook shows the sender's machine" "printf '%s' \"\$out\" | grep -q 'codex:bbbb2222 on m2'"
+printf '{"session_id":"aaaa1111","hook_event_name":"SessionEnd","cwd":"%s"}' "$root/m1/repo" | on m1 "$AL" hook claude-code
+i=0; while [ $i -lt 50 ] && ! grep -qs '^ended=' "$rem/github.com/owner/repo/sessions/aaaa1111"; do sleep 0.1; i=$((i + 1)); done
+on m2 run codex bbbb2222 sync --quiet
+check "sync: SessionEnd's release and ended presence reach the other machine" "! on m2 run codex bbbb2222 claims | grep -q aaaa1111 && ! on m2 run codex bbbb2222 who | grep -q aaaa1111"
+old=$rem/github.com/owner/repo/msgs/20200101T000000.000000Z-old00000-aaaaaa.msg
+printf 'Kind: note\n\nold\n' >"$old"; touch -t 202001010000 "$old"
+rm -f "$root/m2/store/.sync-pruned"
+on m2 run codex bbbb2222 sync --quiet
+check "sync: daily prune expires old files on the remote" "[ ! -e \"$old\" ]"
+check "sync: a remote with shell characters is refused" "! on m1 run x xxxx0000 install --remote 'ssh://h;rm/x' 2>/dev/null && ! on m1 run x xxxx0000 install --remote 'ssh://-oProxyCommand=x/y' 2>/dev/null"
+check "sync: sync_repos keeps other repos off the remote" "on m1 run x xxxx0000 install --sync-repos 'github.com/someone-else/*' >/dev/null && on m1 run x xxxx0000 dir | grep -q 'not in sync_repos' && ! on m1 run x xxxx0000 sync 2>/dev/null"
+check "sync: sync_repos globs match the repo key" "on m1 run x xxxx0000 install --sync-repos 'gitlab.com/x github.com/owner/*' >/dev/null && on m1 run x xxxx0000 sync --quiet"
+git -C "$root/m2/repo" remote remove origin
+check "sync: a repo without origin says why it can't sync" "on m2 run codex bbbb2222 sync 2>&1 | grep -q 'no usable origin'"
 
 # --- identity from agent env vars
 fresh ident

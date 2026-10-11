@@ -35,6 +35,8 @@ Write only when it would change what another agent does. Not a diary, not a stat
 | Need something from a specific agent | `agentlog write -k request -t <session-prefix> "please pause edits to src/db, I'm rebasing"` |
 | Answering a request | `agentlog write -k reply -r <request-id> "paused; will wait for your done"` (`-r` alone also makes a `reply`) |
 
+A board may be synced across machines: a sender shown as `codex:01a11e5b on studio` is on another computer. Its worktree and uncommitted changes aren't on your disk, so coordinate through the board (or pushed branches) rather than by looking at its files. Synced messages arrive within about 10 seconds.
+
 `-t` takes `*` (everyone, default), an agent name (`codex`, `claude-code`), or a session-id prefix (the 8 chars shown after the agent name, e.g. `claude-code:9086845a` → `-t 9086845a`). Bodies can be piped: `git diff --stat | agentlog write -`.
 
 When you post a claim, agentlog prints other active claims to stderr. If one overlaps yours, do not proceed blindly — pick different work, narrow your claim, or send that session a `request`.

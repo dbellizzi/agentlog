@@ -12,7 +12,7 @@ set -eu
 _keep=" PATH HOME USER LOGNAME TMPDIR LANG LC_ALL LC_CTYPE TERM AGENTLOG_SESSION AGENTLOG_AGENT \
 AGENTLOG_DIR AGENTLOG_PREFIX AGENTLOG_NO_INSTALL CODEX_HOME CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID \
 CODEX_THREAD_ID OPENCODE_SESSION_ID CURSOR_SESSION_ID MUSE_SESSION_ID MUSE_THREAD_ID \
-ANTIGRAVITY_CONVERSATION_ID "
+ANTIGRAVITY_CONVERSATION_ID SSH_AUTH_SOCK AGENTLOG_REMOTE "
 for _v in $(env | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p'); do
   case $_keep in *" $_v "*) ;; *) unset "$_v" 2>/dev/null || : ;; esac
 done
@@ -20,7 +20,7 @@ PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:/home/linuxb
 export PATH
 unset _v _keep
 
-VERSION=0.5.0
+VERSION=0.6.0
 # Resolve our own path now: hooks may cd into the workspace later, which
 # would break a relative $0 such as Antigravity's ./bin/agentlog.
 SELF=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
@@ -183,6 +183,13 @@ detect_identity() {
 }
 
 worktree() { git rev-parse --show-toplevel 2>/dev/null || pwd; }
+# Short machine name, shown when a message or session comes from another
+# machine through a synced board. `host=` in the config file overrides it.
+host() {
+  _h=$(config_get host)
+  [ -n "$_h" ] || _h=$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo -)
+  oneline "$_h" | tr -cd 'A-Za-z0-9._-'
+}
 branch() { git symbolic-ref --short -q HEAD 2>/dev/null || git rev-parse --short HEAD 2>/dev/null || echo -; }
 
 # Presence: one file per session, rewritten on each prompt (and every few
@@ -193,9 +200,10 @@ touch_presence() {
   _via=${HOOKED:-}
   [ -z "$_via" ] && grep -qsx 'via=hook' "$W/sessions/$SESSION" "$STORE/sessions/$SESSION" && _via=1
   {
-    printf 'agent=%s\nsession=%s\nbranch=%s\nworktree=%s\nseen=%s\n' \
-      "$AGENT" "$SESSION" "$(branch)" "$(worktree)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'agent=%s\nsession=%s\nbranch=%s\nworktree=%s\nhost=%s\nseen=%s\n' \
+      "$AGENT" "$SESSION" "$(branch)" "$(worktree)" "$(host)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     [ -n "$_via" ] && printf 'via=hook\n'
+    [ -n "${ENDED:-}" ] && printf 'ended=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   } | atomic_write "$W/sessions/$SESSION"
 }
 
@@ -221,10 +229,10 @@ index() {
   stores | while IFS= read -r st; do
     [ -d "$st/msgs" ] && find "$st/msgs" -name '*.msg' -type f
   done | tr '\n' '\0' | xargs -0 awk '
-    FNR == 1 { inh = 1; k = a = s = t = r = e = p = b = d = "" }
+    FNR == 1 { inh = 1; k = a = s = t = r = e = p = b = d = h = "" }
     inh && /^$/ {
       n = FILENAME; sub(/.*\//, "", n); sub(/\.msg$/, "", n)
-      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", n, k, a, s, t, r, e, p, b, d, FILENAME
+      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", n, k, a, s, t, r, e, p, b, d, FILENAME, h
       inh = 0; next
     }
     !inh { next }
@@ -232,6 +240,7 @@ index() {
     key == "Kind" { k = val } key == "Agent" { a = val } key == "Session" { s = val }
     key == "To" { t = val } key == "Re" { r = val } key == "Expires" { e = val }
     key == "Paths" { p = val } key == "Branch" { b = val } key == "Date" { d = val }
+    key == "Host" { h = val }
   ' /dev/null | sort | awk -F '\t' '!seen[$1]++' # /dev/null: never read stdin
 }
 
@@ -276,9 +285,10 @@ active_claims() {
 }
 
 fmt_claims() {
-  awk -F '\t' -v now="$(now_epoch)" -v me="$SESSION" '{
+  awk -F '\t' -v now="$(now_epoch)" -v me="$SESSION" -v here="$(host)" '{
     left = ($7 == "") ? "no expiry" : int(($7 - now) / 60) "m left"
     who = $3 ":" substr($4, 1, 8); if ($4 == me) who = who " (you)"
+    if ($12 != "" && $12 != here) who = who " on " $12
     printf "  %s  %s  [%s]  id=%s\n", who, $8, left, $1
   }'
 }
@@ -305,6 +315,10 @@ agentlog — shared message board for agents working in the same repo
   agentlog install [--codex-rule|--no-codex-rule] [--antigravity-rule|--no-antigravity-rule]
                  [--uninstall] [--quiet]
                  copy to ~/.local/bin; allow it in Codex (unsandboxed) and Antigravity (unprompted)
+  agentlog install --remote URL | --no-remote  [--sync-repos 'GLOB ...']
+                 sync boards with ssh://[user@]host/abs/path (or a directory); limit to
+                 repo keys matching the globs, e.g. 'github.com/me/*' (default all)
+  agentlog sync [--quiet]                  sync this repo's board now (hooks do it every 10s)
   agentlog hook AGENT [EVENT]              hook entry point (reads hook JSON on stdin)
   agentlog dir                             print the store directory
 EOF
@@ -362,6 +376,7 @@ cmd_write() {
     printf 'Id: %s\nDate: %s\nAgent: %s\nSession: %s\nBranch: %s\nWorktree: %s\nKind: %s\nTo: %s\n' \
       "$id" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$AGENT" "$SESSION" "$(oneline "$(branch)")" \
       "$(oneline "$(worktree)")" "$kind" "$(oneline "$to")"
+    printf 'Host: %s\n' "$(host)"
     [ -n "$re" ] && printf 'Re: %s\n' "$(oneline "$re")"
     [ -n "$paths" ] && printf 'Paths: %s\n' "$(oneline "$paths")"
     [ -n "$expires" ] && printf 'Expires: %s\n' "$expires"
@@ -382,10 +397,11 @@ cmd_write() {
 # Print messages compactly (header line + indented body). File paths on stdin.
 fmt_msgs() {
   # shellcheck disable=SC2016
-  tr '\n' '\0' | xargs -0 awk -v now="$(now_epoch)" -v brief="${BRIEF:-}" '
-    FNR == 1 { inh = 1; id = d = a = s = b = k = t = r = p = e = ""; nl = nc = cut = 0 }
+  tr '\n' '\0' | xargs -0 awk -v now="$(now_epoch)" -v brief="${BRIEF:-}" -v here="$(host)" '
+    FNR == 1 { inh = 1; id = d = a = s = b = k = t = r = p = e = h = ""; nl = nc = cut = 0 }
     inh && /^$/ {
       line = "[" d "] " a ":" substr(s, 1, 8)
+      if (h != "" && h != here) line = line " on " h
       if (b != "" && b != "-") line = line " @" b
       line = line "  " k
       if (t != "" && t != "*") line = line " → " t
@@ -402,6 +418,7 @@ fmt_msgs() {
       else if (key == "Branch") b = val; else if (key == "Kind") k = val
       else if (key == "To") t = val; else if (key == "Re") r = val
       else if (key == "Paths") p = val; else if (key == "Expires") e = val
+      else if (key == "Host") h = val
       next
     }
     # Brief mode (hook injections): at most 3 body lines / 300 chars.
@@ -433,8 +450,8 @@ fmt_json() {
     function opt(v) { return (v == "") ? "null" : js(v) }
     function out() {
       if (!any) return
-      printf "{\"id\":%s,\"date\":%s,\"agent\":%s,\"session\":%s,\"branch\":%s,\"kind\":%s,\"to\":%s,\"re\":%s,\"paths\":%s,\"expires\":%s,\"body\":%s}\n",
-        opt(h["Id"]), opt(h["Date"]), opt(h["Agent"]), opt(h["Session"]), opt(h["Branch"]),
+      printf "{\"id\":%s,\"date\":%s,\"agent\":%s,\"session\":%s,\"host\":%s,\"branch\":%s,\"kind\":%s,\"to\":%s,\"re\":%s,\"paths\":%s,\"expires\":%s,\"body\":%s}\n",
+        opt(h["Id"]), opt(h["Date"]), opt(h["Agent"]), opt(h["Session"]), opt(h["Host"]), opt(h["Branch"]),
         opt(h["Kind"]), opt(h["To"]), opt(h["Re"]), opt(h["Paths"]),
         (h["Expires"] ~ /^[0-9]+$/) ? h["Expires"] : "null", js(body)
     }
@@ -561,13 +578,16 @@ cmd_who() {
   ensure_store
   stores | while IFS= read -r st; do
     [ -d "$st/sessions" ] && find "$st/sessions" -type f -mtime -1
-  done | tr '\n' '\0' | xargs -0 awk -F= -v me="$SESSION" '
+  done | tr '\n' '\0' | xargs -0 awk -F= -v me="$SESSION" -v here="$(host)" '
     FNR == 1 && NR > 1 { out() }
     { v[$1] = substr($0, length($1) + 2) }
     END { if (NR) out() }
     function out() {
-      mark = (v["session"] == me) ? " (you)" : ""
-      printf "%s\t%s\t  %s  %s:%s%s  @%s  %s\n", v["seen"], v["session"], v["seen"], v["agent"], substr(v["session"], 1, 8), mark, v["branch"], v["worktree"]
+      if (v["ended"] == "") {
+        mark = (v["session"] == me) ? " (you)" : ""
+        if (v["host"] != "" && v["host"] != here) mark = mark " on " v["host"]
+        printf "%s\t%s\t  %s  %s:%s%s  @%s  %s\n", v["seen"], v["session"], v["seen"], v["agent"], substr(v["session"], 1, 8), mark, v["branch"], v["worktree"]
+      }
       delete v
     }' /dev/null | sort -r | awk -F '\t' '!u[$2]++' | cut -f3-
 }
@@ -602,6 +622,136 @@ cmd_gc() {
     [ -f "$f" ] || continue
     sort "$f" | comm -12 - "$TMP/ids" | atomic_write "$f"
   done
+}
+
+# ---------------------------------------------------------------- sync
+#
+# A synced board stays local: hooks read .agentlog/ exactly as before, and a
+# background `agentlog sync` copies files both ways with a remote, so no tool
+# call ever waits on the network. Messages are immutable and uniquely named,
+# so copying in both directions never conflicts. Presence files have one
+# writer each; the newer copy wins. Read cursors and nudges stay local.
+#
+# Remote (`remote=` in ~/.config/agentlog/config, or AGENTLOG_REMOTE):
+#   ssh://[user@]host/abs/path   rsync over ssh
+#   /abs/path                    a directory (a mount, or tests)
+# Each repo syncs to <remote>/<repo key>, the key being its origin URL without
+# scheme, user and .git (github.com/owner/repo), so every clone of a repo on
+# every machine shares one board.
+
+SYNC_SEC=10
+
+remote_url() { printf '%s' "${AGENTLOG_REMOTE:-$(config_get remote)}"; }
+
+repo_key() {
+  _u=$(git config --get remote.origin.url 2>/dev/null) || return 1
+  _k=$(printf '%s' "$_u" | sed -e 's|^[A-Za-z+]*://||' -e 's|^[^@/]*@||' \
+    -e 's|^\([^/:]*\):[0-9]*/|\1/|' -e 's|^\([^/:]*\):|\1/|' -e 's|\.git/*$||' -e 's|/*$||' |
+    tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9._/-')
+  case $_k in '' | */* ) ;; *) return 1 ;; esac
+  case /$_k/ in */../* | */./* | *//*) return 1 ;; esac
+  printf '%s\n' "$_k"
+}
+
+# Which repos sync: `sync_repos=` in the config, space-separated globs over
+# the repo key (default every repo). Keeps, say, work repos off a home server.
+repo_synced() { # repo_synced KEY
+  _globs=$(config_get sync_repos)
+  set -f
+  # shellcheck disable=SC2254 # the patterns are globs on purpose
+  for _g in ${_globs:-*}; do case $1 in $_g) set +f; return 0 ;; esac; done
+  set +f
+  return 1
+}
+
+# parse_remote URL: sets RHOST ("" for a directory) and RPATH, or fails.
+parse_remote() {
+  RHOST='' RPATH=''
+  case $1 in
+    ssh://*) _r=${1#ssh://}; RHOST=${_r%%/*}; RPATH=/${_r#*/}
+      case $_r in */*) ;; *) return 1 ;; esac ;;
+    /*) RPATH=$1 ;;
+    *) return 1 ;;
+  esac
+  case $RHOST in -* | *[!A-Za-z0-9._@-]*) return 1 ;; esac
+  case $RPATH in *[!A-Za-z0-9._/~-]* | *..*) return 1 ;; esac
+  RPATH=${RPATH%/}
+}
+
+ssh_opts() {
+  printf '%s' '-o BatchMode=yes -o ConnectTimeout=5'
+  [ -d "$HOME/.ssh" ] && printf ' -o ControlMaster=auto -o ControlPath=%s/.ssh/agentlog-%%C -o ControlPersist=120' "$HOME"
+  return 0
+}
+
+cmd_sync() {
+  quiet=0
+  [ "${1:-}" = --quiet ] && quiet=1
+  ensure_store
+  [ -n "$W" ] && [ "$W" = "$STORE" ] || die "sync: the shared store is not writable here"
+  remote=$(remote_url)
+  [ -n "$remote" ] || die "sync: no remote (agentlog install --remote ssh://host/path)"
+  parse_remote "$remote" || die "sync: unsupported remote '$remote' (ssh://host/abs/path or /abs/path)"
+  key=$(repo_key) || die "sync: this repo has no usable origin remote to name its board"
+  repo_synced "$key" || die "sync: $key is not in sync_repos ($(config_get sync_repos))"
+  command -v rsync >/dev/null 2>&1 || die "sync: needs rsync"
+  lock=$STORE/.sync.lock
+  if ! mkdir "$lock" 2>/dev/null; then
+    # A sync that died mid-way leaves its lock; two minutes is plenty.
+    if [ -z "$(find "$lock" -prune -mmin +2 2>/dev/null)" ] || ! { rmdir "$lock" && mkdir "$lock"; } 2>/dev/null; then
+      [ $quiet -eq 1 ] && exit 0
+      die "sync: another sync is running"
+    fi
+  fi
+  trap 'rm -rf "$TMP"; rmdir "$lock" 2>/dev/null' 0
+  dest=$RPATH/$key
+  so=$(ssh_opts)
+  if [ -n "$RHOST" ]; then
+    # shellcheck disable=SC2086,SC2029 # so holds several options; dest is validated
+    ssh $so "$RHOST" "mkdir -p '$dest/msgs' '$dest/sessions'" || die "sync: cannot reach $RHOST"
+    base=$RHOST:$dest
+  else
+    mkdir -p "$dest/msgs" "$dest/sessions" || die "sync: cannot create $dest"
+    base=$dest
+  fi
+  rs() { rsync -e "ssh $so" "$@"; }
+  v=''; [ $quiet -eq 1 ] || v=-v
+  # Messages: copy what the other side lacks. No -t, so a pulled message's
+  # mtime is its arrival here, which the hooks' "anything newer?" check needs.
+  # Presence keeps its times (staleness reads them) and the newer copy wins.
+  if ! { rs -r $v --ignore-existing --include='2*T*Z-*.msg' --exclude='*' "$STORE/msgs/" "$base/msgs/" &&
+    rs -r $v --ignore-existing --include='2*T*Z-*.msg' --exclude='*' "$base/msgs/" "$STORE/msgs/" &&
+    rs -rt $v --update --exclude='.*' "$STORE/sessions/" "$base/sessions/" &&
+    rs -rt $v --update --exclude='.*' "$base/sessions/" "$STORE/sessions/"; }; then
+    die "sync: rsync with $base failed"
+  fi
+  # Once a day, expire old files on the remote the way gc does locally.
+  last=$(cat "$STORE/.sync-pruned" 2>/dev/null || echo 0)
+  case $last in '' | *[!0-9]*) last=0 ;; esac
+  if [ $(($(now_epoch) - last)) -ge 86400 ]; then
+    days=$(config_get gc_days); case $days in '' | *[!0-9]*) days=7 ;; esac
+    prune="find '$dest/msgs' '$dest/sessions' -type f -mtime +$days -exec rm -f {} +"
+    # shellcheck disable=SC2086,SC2029
+    if [ -n "$RHOST" ]; then ssh $so "$RHOST" "$prune"; else sh -c "$prune"; fi &&
+      now_epoch | atomic_write "$STORE/.sync-pruned"
+  fi
+  now_epoch | atomic_write "$STORE/.sync-at"
+  [ $quiet -eq 1 ] || printf 'synced %s with %s\n' "$STORE" "$base"
+}
+
+# Called by every hook: start a background sync when one is due, meaning
+# SYNC_SEC have passed or this machine wrote a message since the last one.
+maybe_sync() {
+  [ "$W" = "$STORE" ] && [ -n "$(remote_url)" ] || return 0
+  _k=$(repo_key) && repo_synced "$_k" || return 0
+  last=$(cat "$STORE/.sync-at" 2>/dev/null || echo 0)
+  case $last in '' | *[!0-9]*) last=0 ;; esac
+  if [ $(($(now_epoch) - last)) -lt "$SYNC_SEC" ] &&
+    [ -z "$(find "$STORE/msgs" -maxdepth 1 -name '*.msg' -newer "$STORE/.sync-at" 2>/dev/null | head -1)" ]; then
+    return 0
+  fi
+  [ -d "$STORE/.sync.lock" ] && [ -z "$(find "$STORE/.sync.lock" -prune -mmin +2 2>/dev/null)" ] && return 0
+  nohup "$SELF" sync --quiet </dev/null >/dev/null 2>&1 &
 }
 
 # ---------------------------------------------------------------- hooks
@@ -796,6 +946,10 @@ cmd_install() {
       --antigravity-rule) arule=yes; shift ;;
       --no-antigravity-rule) arule=no; shift ;;
       --uninstall) uninstall=1; shift ;;
+      --remote) need "$@"; parse_remote "$2" || die "install: unsupported remote '$2' (ssh://host/abs/path or /abs/path)"
+        config_set remote "$2"; printf 'remote: %s (each repo syncs to %s/<repo key>)\n' "$2" "$2"; shift 2 ;;
+      --no-remote) config_set remote ''; printf 'remote: off (boards stay on this machine)\n'; shift ;;
+      --sync-repos) need "$@"; config_set sync_repos "$2"; printf 'sync_repos: %s\n' "${2:-*}"; shift 2 ;;
       *) die "install: unknown option $1" ;;
     esac
   done
@@ -896,6 +1050,7 @@ cmd_hook() {
   [ -n "$W" ] || exit 0
 
   HOOKED=1
+  [ "$event" = SessionEnd ] || maybe_sync
   case $event in
     SessionStart | UserPromptSubmit) touch_presence ;;
     SessionEnd)
@@ -903,7 +1058,11 @@ cmd_hook() {
       if active_claims | awk -F '\t' -v me="$SESSION" '$4 == me { f = 1 } END { exit !f }'; then
         cmd_write -k release "session ended" >/dev/null 2>&1 || :
       fi
-      rm -f "$STORE/sessions/$SESSION" ${LOCAL:+"$LOCAL/sessions/$SESSION"} 2>/dev/null || :
+      # Mark the presence ended rather than delete it: a synced copy on
+      # another machine would only bring it back.
+      ENDED=1 touch_presence
+      [ -n "$LOCAL" ] && [ "$W" != "$LOCAL" ] && rm -f "$LOCAL/sessions/$SESSION" 2>/dev/null
+      maybe_sync
       exit 0
       ;;
     *)
@@ -935,7 +1094,7 @@ cmd_hook() {
     SessionStart)
       claims=$(cmd_claims)
       others=$(stores | while IFS= read -r st; do
-        find "$st/sessions" -maxdepth 1 -type f -mmin -120 ! -name "$SESSION" 2>/dev/null
+        find "$st/sessions" -maxdepth 1 -type f -mmin -120 ! -name "$SESSION" -exec grep -L '^ended=' {} + 2>/dev/null
       done | head -1)
       [ -n "$others$claims$unread" ] || exit 0
       ctx="agentlog: other agents are working in this repo. You are $AGENT:$SHORT (session $SESSION).
@@ -986,11 +1145,17 @@ case $cmd in
   show) cmd_show "$@" ;;
   whoami) printf '%s:%s (session %s)\n' "$AGENT" "$SHORT" "$SESSION" ;;
   gc) cmd_gc "$@" ;;
+  sync) cmd_sync "$@" ;;
   dir)
     ensure_store
     printf '%s\n' "$STORE"
     if [ -z "$W" ]; then printf '(read-only here: nothing writable)\n'
     elif [ "$W" != "$STORE" ]; then printf '(shared store not writable here; writing to %s)\n' "$W"; fi
+    if [ -n "$(remote_url)" ]; then
+      if ! _k=$(repo_key); then printf '(not synced: no usable origin remote)\n'
+      elif ! repo_synced "$_k"; then printf '(not synced: %s is not in sync_repos)\n' "$_k"
+      else printf 'synced with %s/%s\n' "$(remote_url)" "$_k"; fi
+    fi
     ;;
   *) usage >&2; exit 1 ;;
 esac

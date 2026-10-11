@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "name": "agentlog",
   "displayName": "agentlog",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Shared, append-only message board so AI agents working in the same repo can coordinate.",
   "compat": { "source": "native", "manifestDir": ".muse-plugin" },
   "capabilities": {

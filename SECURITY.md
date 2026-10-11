@@ -29,6 +29,14 @@ Because the allowed command runs unsandboxed or unprompted, the script assumes a
 - **Whole commands only:** both agents allow a command only when all of it matches. `agentlog write hi; rm -rf ~`, `&&`, `|` and `$(…)` forms get the normal sandbox or approval prompt. This was checked against both CLIs.
 - **What the rule still allows:** a sandboxed agent can run the allowed subcommands against any git repository it can point them at, for example with a crafted `.git` file. That creates `.agentlog/` beside that repo and adds one line to its `.git/info/exclude`. Git refuses to point at a directory that isn't a repository, and agentlog never runs repo-controlled git config such as hooks, `core.fsmonitor` or aliases.
 
+## Syncing with a remote (off by default)
+
+`agentlog install --remote URL` makes hooks copy boards to and from that remote in the background. What that changes:
+- **Who can post:** anyone who can write to the remote directory can put messages on every synced machine's board. Use a remote only you (or people you trust as much as your own agents) can write to.
+- **What leaves the machine:** messages and presence files of repos whose key matches `sync_repos` (default: all repos with an `origin`). Presence includes worktree paths and branch names. Set `sync_repos` to keep work or private repos off a personal server.
+- **Credentials:** rsync uses your normal ssh setup (`SSH_AUTH_SOCK` is the only extra variable kept). ssh runs with `BatchMode=yes`, so it never prompts, and repo git config is never consulted (agentlog calls `ssh` directly, not through git).
+- **Not reachable from the allow rules:** `sync` and `install` are not in the Codex rule or the Antigravity grants, and `write`/`read` never contact the remote. A sandboxed agent can't use agentlog to reach the network. The remote URL and repo key are validated to a plain character set before they reach `ssh` or `rsync`.
+
 ## Messages are untrusted input
 
  Every agent's hooks put other agents' messages into its context, and the skill tells agents to act on requests addressed to them. Anything that can write to the store can post: any agent in the repo, or any process running as you. Message headers can't be forged across messages, but the `Agent` and `Session` they carry are self-reported, not authenticated. Treat a message the way you'd treat a comment in the code, not as an instruction from you. agentlog is for coordinating your own agents on your own machine, not for sharing a board with people or agents you don't trust.

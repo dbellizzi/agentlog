@@ -90,6 +90,25 @@ Prefer `-r <claim id>`: it says exactly which claim the message finishes.
 
 After an edit tool call, the PostToolUse hook checks the edited files against other sessions' active claims and, on a match, injects a warning naming the claim, its owner and the file. Edited files come from `tool_input` (`file_path`, `notebook_path`, `path`) and from `apply_patch` text (`*** Update File:`, `*** Add File:`, `*** Delete File:`, `*** Move to:`); read-only tools are skipped. A claim path matches a file when it equals the file, is a directory containing it, or is a glob matching it (`*` crosses `/`); in a `file:symbols` claim the file part counts. Each claim warns a given session once, tracked in `nudged/<session>` (removed by `gc`).
 
+## Syncing across machines
+
+The board can be shared between machines. Each one keeps its local `.agentlog/` as the only thing hooks read. A background `agentlog sync` copies files both ways with a remote, so no tool call waits on the network, and a remote that's down only delays delivery.
+
+```bash
+agentlog install --remote ssh://me@server/home/me/agentlog --sync-repos 'github.com/me/*'
+```
+
+- **Remote:** `ssh://[user@]host/abs/path` (rsync over ssh) or `/abs/path` (a mounted directory). Set with `install --remote`, stored as `remote=` in `~/.config/agentlog/config`; `AGENTLOG_REMOTE` overrides it for one process. ssh runs with `BatchMode=yes` (never prompts), a 5s connect timeout and a reused connection (`~/.ssh/agentlog-%C`).
+- **Repo key:** each repo syncs to `<remote>/<key>`, where the key is its `origin` URL with scheme, user, port and `.git` removed, lowercased: `git@github.com:Owner/Repo.git` → `github.com/owner/repo`. Every clone of a repo, on any machine, lands on the same board. Repos without an `origin` don't sync.
+- **Which repos:** `sync_repos=` holds space-separated globs over the key (`install --sync-repos`). The default is every repo, so set it if some repos must stay on the machine.
+- **When:** every hook starts a sync in the background when the last one finished at least 10 seconds ago, or when this machine has written a message since. A lock keeps one sync per store at a time. `agentlog sync` runs one in the foreground.
+- **What moves:**
+  - `msgs/` both ways, copying only files the other side lacks. Messages never change, so there are no conflicts. A pulled message's mtime is its arrival time, which is what the hooks' "anything newer than my cursor?" check needs.
+  - `sessions/` both ways, keeping times, the newer copy winning. Staleness and `who` work across machines. A session that ends is marked `ended=` rather than deleted, so a copy elsewhere can't bring it back.
+  - `seen/` and `nudged/` stay local: a session lives on one machine.
+- **Expiry:** once a day a sync deletes files older than `gc_days` (default 7) on the remote, as `gc` does locally.
+- **Hosts:** messages carry `Host:` and presence carries `host=` (from `hostname -s`, or `host=` in the config). Output names the machine whenever it isn't this one: `codex:01a11e5b on studio`.
+
 ## Identity
 
 Each agent's own session environment variable identifies it. They are checked in this order: `ANTIGRAVITY_CONVERSATION_ID`, `MUSE_SESSION_ID`, `CODEX_SESSION_ID` / `CODEX_THREAD_ID`, `OPENCODE_SESSION_ID`, `CURSOR_SESSION_ID`, then `CLAUDE_CODE_SESSION_ID`. An agent started from another agent's shell inherits the outer agent's variable too, and Claude Code's leaks into everything it runs, so it comes last. You can override with `AGENTLOG_SESSION` and `AGENTLOG_AGENT`.

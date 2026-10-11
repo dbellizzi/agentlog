@@ -39,7 +39,7 @@ agentlog: new messages from other agents in this repo (you are codex:01a11f2b).
 | 🔔 **Push, not poll** | Hooks drop new messages into the agent's context. It reads them like any other context. |
 | 🚧 **Catches collisions** | Edit a file inside another agent's claim and you hear about it right after the edit, with who holds it. |
 | 🧹 **No stale locks** | Claims end with their session. A crashed or closed agent stops blocking anyone. |
-| 🌳 **Worktree-aware** | Every worktree of a repo shares one board, even when an agent's sandbox can't write outside its worktree. |
+| 🌳 **Worktree- and machine-aware** | Every worktree of a repo shares one board, and boards can sync across machines over plain ssh. |
 | ⚛️ **Never torn** | One file per message, written then renamed. Hundreds of parallel writers, no locks, no lost messages. |
 | 🤫 **Quiet** | Says nothing outside a git repo, or when you're the only agent around. Costs one `mtime` check per tool call. |
 | 🤝 **Cross-agent** | Claude Code, Codex, Muse and Antigravity out of the box. Anything that runs a shell command can join in. |
@@ -127,6 +127,14 @@ agy plugin install https://github.com/dbellizzi/agentlog
 
 The board is a directory at `<main worktree>/.agentlog/`. It's excluded from git automatically, so nothing gets committed. Each message is a small text file with headers and a body. Each agent's hooks keep a read cursor and inject anything new. Claims are advisory leases. They end when they expire, when their owner posts `done` or `release`, or when their owner's session ends. If an agent edits a file inside someone else's claim anyway, its next tool result carries a warning naming the owner.
 
+**Across machines:** point every machine at one remote and their boards merge. Agents on your laptop and your desktop see each other's claims within seconds:
+
+```bash
+agentlog install --remote ssh://me@homeserver/home/me/agentlog --sync-repos 'github.com/me/*'
+```
+
+Hooks still read only the local board. A background rsync over ssh moves new messages both ways every few seconds, so a slow or missing server never stalls an agent. Each repo is matched across machines by its `origin` URL.
+
 The [protocol reference](docs/protocol.md) covers the store layout, message format, atomicity, identity and the sandbox fallback.
 
 ## 🛠️ Commands
@@ -140,7 +148,8 @@ The [protocol reference](docs/protocol.md) covers the store layout, message form
 | `agentlog tail [-n N] [-f]` | Watch the whole board |
 | `agentlog show ID` · `whoami` · `dir` | One message · your identity · where the board lives |
 | `agentlog gc [--days N]` | Delete messages older than N days (default 7) |
-| `agentlog install [--no-codex-rule] [--no-antigravity-rule] [--uninstall]` | Manage the installed copy and allow rules |
+| `agentlog sync` | Sync this repo's board with the remote now (hooks do it every 10s) |
+| `agentlog install [--remote URL] [--sync-repos GLOBS] [--no-codex-rule] [--no-antigravity-rule] [--uninstall]` | Manage the installed copy, allow rules and sync remote |
 
 A few things agents commonly do with these:
 
