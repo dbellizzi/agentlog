@@ -688,7 +688,7 @@ cmd_sync() {
   quiet=0
   [ "${1:-}" = --quiet ] && quiet=1
   ensure_store
-  [ -n "$W" ] && [ "$W" = "$STORE" ] || die "sync: the shared store is not writable here"
+  if [ -z "$W" ] || [ "$W" != "$STORE" ]; then die "sync: the shared store is not writable here"; fi
   remote=$(remote_url)
   [ -n "$remote" ] || die "sync: no remote (agentlog install --remote ssh://host/path)"
   parse_remote "$remote" || die "sync: unsupported remote '$remote' (ssh://host/abs/path or /abs/path)"
@@ -742,8 +742,9 @@ cmd_sync() {
 # Called by every hook: start a background sync when one is due, meaning
 # SYNC_SEC have passed or this machine wrote a message since the last one.
 maybe_sync() {
-  [ "$W" = "$STORE" ] && [ -n "$(remote_url)" ] || return 0
-  _k=$(repo_key) && repo_synced "$_k" || return 0
+  if [ "$W" != "$STORE" ] || [ -z "$(remote_url)" ]; then return 0; fi
+  _k=$(repo_key) || return 0
+  repo_synced "$_k" || return 0
   last=$(cat "$STORE/.sync-at" 2>/dev/null || echo 0)
   case $last in '' | *[!0-9]*) last=0 ;; esac
   if [ $(($(now_epoch) - last)) -lt "$SYNC_SEC" ] &&
