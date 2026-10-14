@@ -1,6 +1,6 @@
 {
   "name": "agentlog",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Shared, append-only message board so Codex, Claude Code and other agents working in the same repo (and its worktrees) can claim work, coordinate edits, and ask each other to pause.",
   "author": { "name": "Dominick Bellizzi" },
   "homepage": "https://github.com/dbellizzi/agentlog",

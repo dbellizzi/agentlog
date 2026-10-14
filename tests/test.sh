@@ -184,6 +184,9 @@ aj() { printf '{"conversationId":"%s","workspacePaths":["%s"],"invocationNum":0}
 out=$(aj agyc0001 /nonexistent | "$AL" hook antigravity SessionStart)
 check "hook: antigravity SessionStart injects an ephemeral message" "printf '%s' \"\$out\" | jq -r '.injectSteps[0].ephemeralMessage' | grep -q 'antigravity:agyc0001'"
 check "hook: antigravity PreInvocation silent with nothing new" "[ -z \"\$(aj agyc0001 /nonexistent | \"$AL\" hook antigravity PreInvocation)\" ]"
+out=$(aj agyc0009 /nonexistent | "$AL" hook antigravity PreInvocation)
+check "hook: antigravity 2.0 (no SessionStart): first PreInvocation introduces the board" "printf '%s' \"\$out\" | jq -r '.injectSteps[0].ephemeralMessage' | grep -q 'other agents are working in this repo. You are antigravity:agyc0009'"
+check "hook: antigravity 2.0: later PreInvocations stay quiet" "[ -z \"\$(aj agyc0009 /nonexistent | \"$AL\" hook antigravity PreInvocation)\" ]"
 run codex bbbb2222 write "third note" >/dev/null
 check "hook: antigravity PreInvocation delivers new messages" "aj agyc0001 /nonexistent | \"$AL\" hook antigravity PreInvocation | jq -r '.injectSteps[0].ephemeralMessage' | grep -q 'third note'"
 agr=$root/agy-repo
@@ -412,6 +415,15 @@ check "install: uninstall removes the antigravity grants" "jq -e '.permissions.a
 printf 'not json\n' >"$ags"
 "$AL" install >/dev/null
 check "install: unparsable antigravity settings left alone" "[ \"\$(cat \"$ags\")\" = 'not json' ]"
+agc=$HOME/.gemini/config/config.json
+check "install: antigravity 2.0 config never created" "[ ! -e \"$agc\" ]"
+mkdir -p "$(dirname "$agc")"
+printf '{"userSettings":{"themeMode":"dark","globalPermissionGrants":{"allow":["command(npm test)"]}}}\n' >"$agc"
+"$AL" install >/dev/null
+check "install: antigravity 2.0 grants go into config.json" "[ \"\$(jq --arg d \"command($dest \" '[.userSettings.globalPermissionGrants.allow[] | select(startswith(\$d))] | length' \"$agc\")\" -eq 9 ] && jq -e '.userSettings.themeMode == \"dark\" and .userSettings.globalPermissionGrants.allow[0] == \"command(npm test)\"' \"$agc\" >/dev/null"
+"$AL" install --no-antigravity-rule >/dev/null
+check "install: --no-antigravity-rule cleans antigravity 2.0 config too" "jq -e '.userSettings.globalPermissionGrants.allow == [\"command(npm test)\"]' \"$agc\" >/dev/null"
+"$AL" install --antigravity-rule >/dev/null
 rm -rf "$HOME/.gemini"
 
 # --- hardening: hostile environment and arguments
@@ -454,7 +466,7 @@ muse_hooks_ok() { # every Muse hook runs its own wrapper, which runs bin/agentlo
 }
 check "plugin: muse hooks run their wrappers for bin/agentlog hook muse" muse_hooks_ok
 check "plugin: muse skill path exists" "[ -f \"$pl/\$(jq -r '.capabilities.skills[0].path' \"$pl/.muse-plugin/plugin.json\")\" ]"
-check "plugin: antigravity hooks run ./bin/agentlog hook antigravity" "[ \"\$(jq -r '.agentlog | to_entries[] | .value[].command' \"$pl/hooks.json\" | grep -c '^\./bin/agentlog hook antigravity \(SessionStart\|PreInvocation\)$')\" -eq 2 ]"
+check "plugin: antigravity hook (PreInvocation only, as 2.0 supports) runs ./bin/agentlog hook antigravity" "[ \"\$(jq -r '.agentlog | to_entries[] | .value[].command' \"$pl/hooks.json\" | grep -c '^\./bin/agentlog hook antigravity PreInvocation$')\" -eq 1 ] && [ \"\$(jq '.agentlog | keys' \"$pl/hooks.json\" | jq -c .)\" = '[\"PreInvocation\"]' ]"
 check "plugin: no symlinks in the plugin (Muse refuses them)" "[ -z \"\$(cd \"$pl\" && find . -path ./.git -prune -o -type l -print)\" ]"
 for v in muse:'muse plugins validate' agy:'agy plugin validate'; do
   if command -v "${v%%:*}" >/dev/null; then

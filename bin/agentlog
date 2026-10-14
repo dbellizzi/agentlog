@@ -20,7 +20,7 @@ PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:/home/linuxb
 export PATH
 unset _v _keep
 
-VERSION=0.6.0
+VERSION=0.6.1
 # Resolve our own path now: hooks may cd into the workspace later, which
 # would break a relative $0 such as Antigravity's ./bin/agentlog.
 SELF=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
@@ -892,7 +892,13 @@ EOF
 # headless runs otherwise auto-deny. Same subcommands as the Codex rule. Not
 # a sandbox bypass. Merged with jq so the rest of the file is untouched;
 # skipped without jq, or when the file does not parse.
-agy_settings() { printf '%s/.gemini/antigravity-cli/settings.json\n' "$HOME"; }
+# Where Antigravity keeps permission grants: the CLI's settings file, and the
+# shared config that Antigravity 2.0 migrated everything into (edited only if
+# it already exists). FILE<TAB>JSON path of the allow list.
+agy_targets() {
+  printf '%s/.gemini/antigravity-cli/settings.json\t["permissions","allow"]\n' "$HOME"
+  printf '%s/.gemini/config/config.json\t["userSettings","globalPermissionGrants","allow"]\n' "$HOME"
+}
 agy_grants() { # agy_grants DEST -> JSON array of command(...) grants
   printf '['; _sep=''
   for _s in write w read r claims who show whoami dir; do
@@ -901,23 +907,27 @@ agy_grants() { # agy_grants DEST -> JSON array of command(...) grants
   printf ']\n'
 }
 agy_edit() { # agy_edit add|remove DEST
-  _f=$(agy_settings)
-  [ -d "$(dirname "$_f")" ] && command -v jq >/dev/null 2>&1 || return 0
-  [ -f "$_f" ] || [ "$1" = add ] || return 0
-  _in=$(cat "$_f" 2>/dev/null || :)
-  [ -n "$_in" ] || _in='{}'
-  if [ "$1" = add ]; then
-    _p='(.permissions.allow // []) as $a | .permissions.allow = $a + ($g - $a)'
-  else
-    _p='if (.permissions.allow | type) == "array" then .permissions.allow -= $g else . end'
-  fi
-  _out=$(printf '%s' "$_in" | jq --argjson g "$(agy_grants "$2")" "$_p" 2>/dev/null) || return 0
-  if [ "$(printf '%s' "$_in" | jq -c . 2>/dev/null)" = "$(printf '%s' "$_out" | jq -c .)" ]; then
-    say "up to date: $_f"
-    return 0
-  fi
-  (umask 077 && printf '%s\n' "$_out" >"$_f.tmp.$$") && mv -f "$_f.tmp.$$" "$_f"
-  if [ "$1" = add ]; then say "antigravity grants: $_f (agy runs $2 board commands without asking)"; else say "removed agentlog grants from $_f"; fi
+  command -v jq >/dev/null 2>&1 || return 0
+  tab=$(printf '\t')
+  agy_targets | while IFS=$tab read -r _f _path; do
+    [ -d "$(dirname "$_f")" ] || continue
+    case $_f in */config/config.json) [ -f "$_f" ] || continue ;; esac
+    [ -f "$_f" ] || [ "$1" = add ] || continue
+    _in=$(cat "$_f" 2>/dev/null || :)
+    [ -n "$_in" ] || _in='{}'
+    if [ "$1" = add ]; then
+      _p='(getpath($p) // []) as $a | setpath($p; $a + ($g - $a))'
+    else
+      _p='if (getpath($p) | type) == "array" then setpath($p; getpath($p) - $g) else . end'
+    fi
+    _out=$(printf '%s' "$_in" | jq --argjson g "$(agy_grants "$2")" --argjson p "$_path" "$_p" 2>/dev/null) || continue
+    if [ "$(printf '%s' "$_in" | jq -c . 2>/dev/null)" = "$(printf '%s' "$_out" | jq -c .)" ]; then
+      say "up to date: $_f"
+      continue
+    fi
+    (umask 077 && printf '%s\n' "$_out" >"$_f.tmp.$$") && mv -f "$_f.tmp.$$" "$_f"
+    if [ "$1" = add ]; then say "antigravity grants: $_f (Antigravity runs $2 board commands without asking)"; else say "removed agentlog grants from $_f"; fi
+  done
 }
 
 # Copies this script to $AGENTLOG_PREFIX (~/.local/bin) and, when Codex or
@@ -1036,7 +1046,10 @@ cmd_hook() {
   fi
   # Antigravity runs PreInvocation before every model call; treat it like a
   # prompt submission (presence, then the cheap "anything new?" check).
-  [ "$event" = PreInvocation ] && event=UserPromptSubmit
+  # Antigravity 2.0 has no SessionStart, so a conversation's first
+  # PreInvocation (no presence record yet) stands in for it below.
+  first_call=''
+  [ "$event" = PreInvocation ] && event=UserPromptSubmit first_call=1
   if [ -n "$dir" ] && [ -d "$dir" ]; then cd "$dir" || exit 0; fi
   [ -n "$sid" ] && AGENTLOG_SESSION=$sid
   [ -n "$agent" ] && AGENTLOG_AGENT=$agent
@@ -1044,10 +1057,14 @@ cmd_hook() {
   if [ -z "${AGENTLOG_DIR:-}" ] && ! git rev-parse --git-dir >/dev/null 2>&1; then exit 0; fi
   detect_identity
 
+  ensure_store
+  if [ -n "$first_call" ] && [ ! -f "$STORE/sessions/$SESSION" ] &&
+    { [ -z "$LOCAL" ] || [ ! -f "$LOCAL/sessions/$SESSION" ]; }; then
+    event=SessionStart
+  fi
   if [ "$event" = SessionStart ] && [ -z "${AGENTLOG_NO_INSTALL:-}" ]; then
     (cmd_install --auto) >/dev/null 2>&1 || :
   fi
-  ensure_store
   [ -n "$W" ] || exit 0
 
   HOOKED=1

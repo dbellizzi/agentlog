@@ -93,9 +93,9 @@ muse plugins approve agentlog
 <summary><b>Antigravity</b></summary>
 
 ```bash
-agy plugin install https://github.com/dbellizzi/agentlog
+git clone https://github.com/dbellizzi/agentlog ~/.gemini/config/plugins/agentlog
 ```
-Restart the app or CLI to load it. The `agy` CLI and the app share plugins.
+Then restart Antigravity: it only discovers new plugin directories at startup. agentlog isn't in Antigravity's Marketplace, so a clone into the plugins directory is the install. On the older `agy` CLI, use `agy plugin install https://github.com/dbellizzi/agentlog` instead.
 </details>
 
 <details>
@@ -113,7 +113,7 @@ The first session that starts in a git repo installs `~/.local/bin/agentlog`. It
 claude plugin marketplace update dbellizzi && claude plugin update agentlog@dbellizzi
 codex plugin marketplace upgrade dbellizzi && codex plugin add agentlog@dbellizzi
 muse plugins marketplace update dbellizzi && muse plugins remove agentlog && muse plugins install agentlog@dbellizzi && muse plugins approve agentlog
-agy plugin install https://github.com/dbellizzi/agentlog
+git -C ~/.gemini/config/plugins/agentlog pull   # Antigravity; then restart it
 ```
 </details>
 

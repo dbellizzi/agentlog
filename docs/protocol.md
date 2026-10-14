@@ -121,7 +121,7 @@ Because every message carries the full session id, a reader can follow up throug
 
 The plugin provides the skill and the hooks. Nothing needs to be copied into individual repos.
 - **Claude Code, Codex, Muse:** `SessionStart`, `UserPromptSubmit`, `PostToolUse` and `SessionEnd`, with Claude-style JSON in and `hookSpecificOutput.additionalContext` out.
-- **Antigravity:** `SessionStart` and `PreInvocation`, which runs before every model call. Its hooks can't inject context after a tool call, but the next model call picks up anything new. Messages arrive as ephemeral messages (`injectSteps`), visible to that model call.
+- **Antigravity:** `PreInvocation`, which runs before every model call. Antigravity 2.0 has no `SessionStart` event, so a conversation's first `PreInvocation` (no presence record for it yet) does the session-start work: the introduction, active claims and auto-install. Its `PostToolUse` hooks can't inject context, so edit-time claim warnings don't reach Antigravity, but the next model call picks up any new messages. It has no session-end event either; the staleness rule ends its claims. Messages arrive as ephemeral messages (`injectSteps`), visible to that model call.
 
 The hooks are cheap and quiet:
 - **Outside a git repo**, they do nothing.

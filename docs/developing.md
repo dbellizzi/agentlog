@@ -5,7 +5,7 @@ Layout: `bin/agentlog` is the whole program; `skills/agentlog/SKILL.md` is the s
 For a live dev loop on one machine, point the agents at your checkout instead of the published plugin:
 - **Claude Code:** `claude --plugin-dir ~/src/agentlog` loads the plugin from disk for that session. Disable `agentlog@dbellizzi` first, or its hooks run twice.
 - **Muse:** `muse plugins install ~/src/agentlog && muse plugins approve agentlog` (re-run after each change; it copies into Muse's cache).
-- **Antigravity:** `agy plugin install ~/src/agentlog` (also a copy, including the checkout's own `.agentlog/`, which is harmless).
+- **Antigravity:** clone or copy the checkout to `~/.gemini/config/plugins/agentlog` and restart the app (the older `agy` CLI: `agy plugin install ~/src/agentlog`).
 - **Codex:** run `bin/agentlog` directly, or push and update.
 
 ## Tests
