@@ -1515,10 +1515,11 @@ body {
   .layout { height: 100%; max-width: none; grid-template-columns: minmax(480px, 44%) minmax(0, 1fr); align-items: stretch; }
   .left { height: 100%; min-height: 0; }
   .left > header, .left > .counts { flex: none; }
-  .left > .claims-panel { flex: 0 1 auto; max-height: 40%; min-height: 0; display: flex; flex-direction: column; }
+  .left > .claims-panel { flex: 0 0 auto; max-height: 40%; min-height: 0; display: flex; flex-direction: column; }
   .left > .sessions-panel { flex: 1 1 0; min-height: 0; display: flex; flex-direction: column; }
   .left > .panel .bar { flex: none; }
   .left > .panel .tblwrap { flex: 1 1 0; min-height: 0; }
+  .left > .claims-panel .tblwrap { flex: 0 1 auto; min-height: 0; }
   .msgpanel { height: 100%; min-height: 0; }
   .msgpanel .scroll { flex: 1 1 0; min-height: 0; }
 }
@@ -1617,6 +1618,7 @@ header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; mi
 .wrap-path { display: block; overflow-wrap: anywhere; }
 .nowrap { white-space: nowrap; }
 .tag { color: var(--muted); font-size: 10px; border: 1px solid var(--line); border-radius: 6px; padding: 0 4px; margin-left: 4px; }
+.tbl td.empty { color: var(--muted); }
 .empty { padding: 12px; color: var(--muted); font-family: var(--mono); font-size: 13px; }
 .scroll { padding: 12px; }
 .msgs { display: flow-root; list-style: none; margin: 0; padding: 0; min-width: 0; }
@@ -1911,8 +1913,8 @@ const wideQuery = window.matchMedia('(min-width: 1100px)');
 let claims = [];
 let sessions = [];
 const tables = {
-  claims: { page: 0, pager: null, cols: 6, empty: 'no active claims' },
-  sessions: { page: 0, pager: null, cols: 4, empty: 'no sessions' },
+  claims: { page: 0, pager: null, cols: 6, empty: 'no active claims', rowH: 28, lastPer: 0 },
+  sessions: { page: 0, pager: null, cols: 4, empty: 'no sessions', rowH: 28, lastPer: 0 },
 };
 const STACKED_ROWS = 10;
 
@@ -1933,9 +1935,7 @@ function rowsPerPage(key) {
   const left = document.querySelector('.left');
   const panelH = key === 'claims' ? left.clientHeight * 0.4 : panel.clientHeight;
   const bodyH = panelH - panel.querySelector('.bar').offsetHeight - panel.querySelector('thead').offsetHeight - 2;
-  const sample = panel.querySelector('tbody tr');
-  const rowH = Math.max(20, sample ? sample.offsetHeight : 28);
-  return Math.max(1, Math.floor(bodyH / rowH));
+  return Math.max(1, Math.floor(bodyH / tables[key].rowH));
 }
 
 function claimRow(c) {
@@ -1967,6 +1967,7 @@ function renderTable(key) {
   const st = tables[key];
   const rows = key === 'claims' ? claims : sessions;
   const per = rowsPerPage(key);
+  st.lastPer = per;
   const pages = Math.max(1, Math.ceil(rows.length / per));
   st.page = Math.max(0, Math.min(st.page, pages - 1));
   const body = document.querySelector('#' + key + ' tbody');
@@ -1977,6 +1978,9 @@ function renderTable(key) {
     for (const r of rows.slice(st.page * per, st.page * per + per)) {
       body.appendChild(key === 'claims' ? claimRow(r) : sessionRow(r));
     }
+    // The next page size comes from this measured row (the empty-state row is taller).
+    const first = body.querySelector('tr');
+    if (first) st.rowH = Math.max(20, first.offsetHeight);
   }
   const pg = st.pager;
   pg.host.hidden = pages <= 1;
@@ -2206,7 +2210,7 @@ function renderPlayer(last, top) {
 function scheduleRender() {
   if (renderQueued) return;
   renderQueued = true;
-  requestAnimationFrame(render);
+  setTimeout(render, 16);   // a timer, not a frame: it also runs in background tabs
 }
 
 function addMessage(m) {
@@ -2278,15 +2282,33 @@ document.querySelector('.msgpanel').addEventListener('wheel', (e) => {
 // ---------------------------------------------------------------- startup and events
 
 const dot = document.getElementById('dot');
-let resizeTimer = null;
-window.addEventListener('resize', () => {
-  clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(() => {
+// Page sizes depend on the column's height, so redraw whenever the column changes size.
+// The observer fires after layout; a plain resize event can fire before it.
+let relayoutTimer = null;
+function relayout() {
+  clearTimeout(relayoutTimer);
+  relayoutTimer = setTimeout(() => {
     renderTable('claims');
     renderTable('sessions');
     scheduleRender();
-  }, 150);
-});
+  }, 100);
+}
+window.addEventListener('resize', relayout);
+if (window.ResizeObserver) new ResizeObserver(relayout).observe(document.querySelector('.left'));
+// Resize events and observers also wait for a frame, so a timer checks the measures
+// too: a page size that changed, the breakpoint, or the height of the message window.
+let lastWide = wideQuery.matches;
+let lastScrollH = -1;
+setInterval(() => {
+  for (const key of ['claims', 'sessions']) {
+    if (rowsPerPage(key) !== tables[key].lastPer) renderTable(key);
+  }
+  if (wideQuery.matches !== lastWide || scroller.clientHeight !== lastScrollH) {
+    lastWide = wideQuery.matches;
+    lastScrollH = scroller.clientHeight;
+    scheduleRender();
+  }
+}, 400);
 buildPager('claims');
 buildPager('sessions');
 renderTable('claims');
