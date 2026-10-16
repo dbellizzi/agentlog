@@ -1502,13 +1502,26 @@ body {
   background-size: auto, auto, 28px 28px, auto;
   background-attachment: fixed;
 }
+/* Stacked (below 1100px): the window is the only scroller. */
 .layout { display: grid; gap: 18px; grid-template-columns: minmax(0, 1fr); max-width: 1280px; margin: 0 auto; min-width: 0; }
-.left { display: grid; gap: 18px; align-content: start; min-width: 0; }
-.msgpanel { display: flex; flex-direction: column; min-width: 0; max-height: 75vh; }
-.msgpanel .scroll { flex: 1; min-height: 0; min-width: 0; overflow-x: hidden; overflow-y: auto; }
+.left { display: flex; flex-direction: column; gap: 18px; min-width: 0; }
+.left > .panel { flex: none; }
+.msgpanel { display: flex; flex-direction: column; min-width: 0; }
+.msgpanel .scroll { min-width: 0; overflow: visible; }
+/* The scroll position is adjusted by the script, not by the browser's anchoring. */
+html, .msgpanel .scroll { overflow-anchor: none; }
+/* Wide (1100px and up): a screen as tall as the viewport. Only panels scroll. */
 @media (min-width: 1100px) {
-  .layout { grid-template-columns: minmax(480px, 44%) minmax(0, 1fr); align-items: start; }
-  .msgpanel { height: calc(100vh - 32px); max-height: none; position: sticky; top: 16px; }
+  body { height: 100vh; min-height: 0; overflow: hidden; }
+  .layout { height: 100%; max-width: none; grid-template-columns: minmax(480px, 44%) minmax(0, 1fr); align-items: stretch; }
+  .left { height: 100%; min-height: 0; }
+  .left > header, .left > .counts { flex: none; }
+  .left > .claims-panel { flex: 0 1 auto; max-height: 40%; min-height: 0; display: flex; flex-direction: column; }
+  .left > .sessions-panel { flex: 1 1 0; min-height: 0; display: flex; flex-direction: column; }
+  .left > .panel .bar { flex: none; }
+  .left > .panel .tblwrap { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+  .msgpanel { height: 100%; min-height: 0; }
+  .msgpanel .scroll { flex: 1 1 0; min-height: 0; overflow-y: auto; }
 }
 header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; min-width: 0; }
 .wordmark {
@@ -1548,6 +1561,7 @@ header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; mi
 .tbl col.c-paths { width: calc((100% - 32px) * 0.268); } .tbl col.c-desc { width: calc((100% - 32px) * 0.227); }
 .tbl col.c-left { width: calc((100% - 32px) * 0.072); } .tbl col.c-copy { width: 32px; }
 .tbl th { text-align: left; color: var(--muted); font-weight: 600; padding: 6px 8px; white-space: nowrap; overflow: hidden; }
+.tbl thead th { position: sticky; top: 0; z-index: 1; background: #0f1426; }
 .tbl td {
   text-align: left; vertical-align: middle; color: var(--second); padding: 6px 8px; min-width: 0;
   border-top: 1px solid var(--row); line-height: 1.25; white-space: nowrap; overflow: hidden;
@@ -1642,21 +1656,21 @@ header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; mi
       <span class="pill"><i id="dot" class="dot"></i><span id="pill">0 agents &middot; 1 board</span></span>
     </header>
     <div class="counts" id="counts"></div>
-    <section class="panel">
+    <section class="panel claims-panel">
       <div class="bar"><span class="lights"><i class="r"></i><i class="y"></i><i class="g"></i></span><span class="title">active claims</span></div>
-      <table class="tbl" id="claims">
+      <div class="tblwrap"><table class="tbl" id="claims">
         <colgroup><col class="c-owner"><col class="c-branch"><col class="c-paths"><col class="c-desc"><col class="c-left"><col class="c-copy"></colgroup>
         <thead><tr><th>owner</th><th>branch</th><th>paths</th><th>description</th><th>time left</th><th></th></tr></thead>
         <tbody></tbody>
-      </table>
+      </table></div>
     </section>
-    <section class="panel">
+    <section class="panel sessions-panel">
       <div class="bar"><span class="lights"><i class="r"></i><i class="y"></i><i class="g"></i></span><span class="title">sessions, last 24h</span></div>
-      <table class="tbl" id="sessions">
+      <div class="tblwrap"><table class="tbl" id="sessions">
         <colgroup><col style="width:24%"><col style="width:18%"><col style="width:36%"><col style="width:22%"></colgroup>
         <thead><tr><th>owner</th><th>branch</th><th>worktree</th><th>last seen</th></tr></thead>
         <tbody></tbody>
-      </table>
+      </table></div>
     </section>
   </div>
   <section class="panel msgpanel">
@@ -1823,6 +1837,12 @@ function pathsCell(paths) {
 
 const list = document.getElementById('messages');
 const scroller = document.getElementById('scroll');
+const wideQuery = window.matchMedia('(min-width: 1100px)');
+// Prepending keeps the view still. Wide: the messages panel scrolls. Stacked: the window does.
+function viewOffset() { return wideQuery.matches ? scroller.scrollTop : window.scrollY; }
+function nudgeView(px) { if (wideQuery.matches) scroller.scrollTop += px; else window.scrollBy(0, px); }
+// A card's height with its margins: the space its insertion adds above the view.
+function spacePx(li) { const cs = getComputedStyle(li); return li.offsetHeight + parseFloat(cs.marginTop) + parseFloat(cs.marginBottom); }
 const seenIds = new Set();
 let claims = [];
 let sessions = [];
@@ -1959,10 +1979,10 @@ function addMessage(m) {
   content.appendChild(el('div', 'text', m.body == null ? '' : m.body));
   li.appendChild(content);
 
-  const scrolled = scroller.scrollTop > 0;
+  const scrolled = viewOffset() > 0;
   list.prepend(li);
   clampToggle(li);
-  if (scrolled) scroller.scrollTop += li.offsetHeight;
+  if (scrolled) nudgeView(spacePx(li));
   if (m.id) seenIds.add(m.id);
   while (list.children.length > MAX) {
     const old = list.lastElementChild;
