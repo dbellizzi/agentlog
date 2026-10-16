@@ -20,7 +20,7 @@ PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:/home/linuxb
 export PATH
 unset _v _keep
 
-VERSION=0.6.1
+VERSION=0.7.0
 # Resolve our own path now: hooks may cd into the workspace later, which
 # would break a relative $0 such as Antigravity's ./bin/agentlog.
 SELF=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
@@ -319,6 +319,9 @@ agentlog — shared message board for agents working in the same repo
                  sync boards with ssh://[user@]host/abs/path (or a directory); limit to
                  repo keys matching the globs, e.g. 'github.com/me/*' (default all)
   agentlog sync [--quiet]                  sync this repo's board now (hooks do it every 10s)
+  agentlog dashboard [--port P] [-n N] [--no-open]
+                 live page of the board at http://127.0.0.1:P/ (P 0 = any free port);
+                 opens it in the browser when run from a terminal
   agentlog hook AGENT [EVENT]              hook entry point (reads hook JSON on stdin)
   agentlog dir                             print the store directory
 EOF
@@ -574,11 +577,17 @@ cmd_claims() {
   active_claims | fmt_claims
 }
 
-cmd_who() {
-  ensure_store
+# Presence records written in the last day, across every store. `who` and the
+# dashboard both read sessions through this walk.
+session_files() {
   stores | while IFS= read -r st; do
     [ -d "$st/sessions" ] && find "$st/sessions" -type f -mtime -1
-  done | tr '\n' '\0' | xargs -0 awk -F= -v me="$SESSION" -v here="$(host)" '
+  done
+}
+
+cmd_who() {
+  ensure_store
+  session_files | tr '\n' '\0' | xargs -0 awk -F= -v me="$SESSION" -v here="$(host)" '
     FNR == 1 && NR > 1 { out() }
     { v[$1] = substr($0, length($1) + 2) }
     END { if (NR) out() }
@@ -1143,6 +1152,869 @@ $unread"
   fi
 }
 
+# ---------------------------------------------------------------- dashboard
+#
+# `dashboard` serves a live page of the board on 127.0.0.1. The shell side
+# gathers the data with the functions the other commands use and writes one
+# event per line; the Perl program below (core modules only, embedded so that
+# `install`, which copies this one file, carries it) only serves it. It is
+# read-only: no presence, no read cursors.
+
+json_array() { awk 'BEGIN { printf "[" } NR > 1 { printf "," } { printf "%s", $0 } END { print "]" }'; }
+
+# Sessions as TSV, newest first, one line per session:
+#   seen session agent branch worktree stale(1|0)
+# Same walk as `who`; ended sessions are skipped. A session is stale when it is
+# hooked (via=hook) and was last seen more than STALE_MIN minutes ago.
+sessions_tsv() {
+  session_files | while IFS= read -r f; do
+    stale=0
+    if grep -qsx 'via=hook' "$f" && [ -n "$(find "$f" -prune -mmin +"$STALE_MIN")" ]; then stale=1; fi
+    awk -F= -v stale="$stale" '
+      { v[$1] = substr($0, length($1) + 2) }
+      END {
+        if (v["ended"] == "" && v["session"] != "")
+          printf "%s\t%s\t%s\t%s\t%s\t%s\n", v["seen"], v["session"], v["agent"], v["branch"], v["worktree"], stale
+      }' "$f"
+  done | sort -r | awk -F '\t' '!u[$2]++'
+}
+
+# The same sessions as a JSON array, escaped per character like fmt_json.
+sessions_json() {
+  sessions_tsv | awk -F '\t' '
+    BEGIN {
+      for (i = 1; i < 32; i++) esc[sprintf("%c", i)] = sprintf("\\u%04x", i)
+      esc["\n"] = "\\n"; esc["\t"] = "\\t"; esc["\r"] = "\\r"; esc["\""] = "\\\""; esc["\\"] = "\\\\"
+      printf "["
+    }
+    function js(v,   o, c, i) {
+      o = ""
+      for (i = 1; i <= length(v); i++) { c = substr(v, i, 1); o = o ((c in esc) ? esc[c] : c) }
+      return "\"" o "\""
+    }
+    {
+      printf "%s{\"agent\":%s,\"session\":%s,\"branch\":%s,\"worktree\":%s,\"seen\":%s,\"stale\":%s}",
+        (NR > 1 ? "," : ""), js($3), js($2), js($4), js($5), js($1), ($6 == 1 ? "true" : "false")
+    }
+    END { print "]" }'
+}
+
+# The event feed for dashboard_pl, one event per line:
+#   store "PATH"          once, the store path shown on the page
+#   msg {json}            a message, oldest first; the last LIMIT at start, then new ones
+#   claims [...]          active claims, when they change
+#   sessions [...]        sessions, when they change
+#   tick                  every poll: ignored by the server, but a write to a server
+#                         that has exited fails, so the feed stops (see below)
+# The loop also ends when its parent shell is gone. Without that check a feed
+# whose server died and whose shell was killed would keep polling forever.
+dashboard_feed() { # dashboard_feed LIMIT OWNER_PID
+  _lim=$1 _owner=$2 _w=$TMP/feed first=1
+  : >"$_w.claims"; : >"$_w.sessions"; : >"$_w.ids"
+  printf 'store '; json_str "$STORE"; printf '\n'
+  while kill -0 "$_owner" 2>/dev/null; do
+    index >"$_w.idx"
+    if [ $first -eq 1 ]; then
+      tail -n "$_lim" "$_w.idx" | cut -f11 | fmt_json | sed 's/^/msg /'
+      first=0
+    else
+      awk -F '\t' -v seen="$_w.ids" '
+        BEGIN { while ((getline id <seen) > 0) s[id] = 1 }
+        !($1 in s)' "$_w.idx" | cut -f11 | fmt_json | sed 's/^/msg /'
+    fi
+    cut -f1 "$_w.idx" >"$_w.ids"
+    active_claims | cut -f11 | fmt_json | json_array >"$_w.cn"
+    cmp -s "$_w.cn" "$_w.claims" || { printf 'claims '; cat "$_w.cn"; mv -f "$_w.cn" "$_w.claims"; }
+    sessions_json >"$_w.sn"
+    cmp -s "$_w.sn" "$_w.sessions" || { printf 'sessions '; cat "$_w.sn"; mv -f "$_w.sn" "$_w.sessions"; }
+    printf 'tick\n'
+    sleep 2
+  done
+}
+
+cmd_dashboard() {
+  port=4747 limit=1000 open_browser=1
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --port) need "$@"; port=$2; shift 2 ;;
+      -n) need "$@"; limit=$2; shift 2 ;;
+      --no-open) open_browser=0; shift ;;
+      *) die "dashboard: unknown option $1" ;;
+    esac
+  done
+  case $port in '' | *[!0-9]*) die "dashboard: --port needs an integer from 0 to 65535" ;; esac
+  [ "$port" -le 65535 ] || die "dashboard: --port needs an integer from 0 to 65535"
+  case $limit in '' | *[!0-9]*) die "dashboard: -n needs a positive integer" ;; esac
+  [ "$limit" -gt 0 ] || die "dashboard: -n needs a positive integer"
+  command -v perl >/dev/null 2>&1 || die "dashboard needs perl"
+  # The page opens in the default browser only from a terminal, and not with
+  # --no-open. Perl runs the opener once the server is listening; no opener
+  # (empty) means nothing is opened.
+  opener=''
+  if [ $open_browser -eq 1 ] && [ -t 1 ]; then
+    if [ "$(uname -s)" = Darwin ]; then opener=$(command -v open 2>/dev/null) || :
+    else opener=$(command -v xdg-open 2>/dev/null) || :; fi
+  fi
+  ensure_store
+  DASHBOARD_PL=$(dashboard_pl)
+  # The server is a direct background job, so $! is its own pid, and the feed
+  # writes into a FIFO. The traps kill both at once, so the port is free as
+  # soon as this shell gets INT or TERM. Background jobs ignore SIGINT in a
+  # non-interactive shell, which is why the trap, not the terminal, stops perl.
+  fifo=$TMP/feed.fifo
+  mkfifo "$fifo"
+  perl -e "$DASHBOARD_PL" -- "$port" "$limit" "$opener" <"$fifo" &
+  pid=$!
+  dashboard_feed "$limit" "$$" >"$fifo" &
+  fpid=$!
+  trap 'kill "$pid" "$fpid" 2>/dev/null; exit 130' INT
+  trap 'kill "$pid" "$fpid" 2>/dev/null; exit 143' TERM
+  status=0
+  wait "$pid" || status=$?
+  kill "$fpid" 2>/dev/null || :
+  exit "$status"
+}
+
+# The server. Single-threaded select loop over stdin (the feed), the listening
+# socket and the clients. Routes: / (page), /app.js, /events (SSE). GET only,
+# Host must be localhost or 127.0.0.1 (DNS rebinding), no CORS.
+dashboard_pl() {
+  cat <<'PERL'
+use strict;
+use warnings;
+use Errno qw(EAGAIN EINTR);
+use IO::Socket::INET;
+use IO::Select;
+use POSIX ();
+
+my ($want_port, $cap, $opener) = @ARGV;
+$opener = '' unless defined $opener;
+$want_port = 0 unless defined $want_port && $want_port =~ /^\d+$/;
+$cap = 1000 unless defined $cap && $cap =~ /^\d+$/ && $cap > 0;
+$| = 1;
+$SIG{PIPE} = 'IGNORE';
+$SIG{CHLD} = 'IGNORE';   # reap the opener without a zombie
+
+my ($PAGE, $APP_JS);  # set below, before the loop
+my $CSP = "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'";
+my $MAX_OUT = 1024 * 1024;
+my %REASON = (200 => 'OK', 400 => 'Bad Request', 403 => 'Forbidden', 404 => 'Not Found', 405 => 'Method Not Allowed');
+my %clients;          # fileno => { sock, in, out, sse, closing }
+my @ring;             # { id, json } for the last $cap messages
+my $store = '""';     # JSON string of the store path
+my $claims = '[]';
+my $sessions = '[]';
+my $in_buf = '';
+my $last_ping = time;
+
+my $listen = IO::Socket::INET->new(
+    LocalAddr => '127.0.0.1',
+    LocalPort => $want_port,
+    Proto     => 'tcp',
+    Listen    => 16,
+    ReuseAddr => 1,
+) or die "agentlog: dashboard: cannot listen on 127.0.0.1:$want_port: $!\n";
+my $port = $listen->sockport;
+print "agentlog: dashboard at http://127.0.0.1:$port/ (Ctrl-C to stop)\n";
+if ($opener ne '') {
+    my $url = "http://127.0.0.1:$port/";
+    my $pid = fork();
+    if (defined $pid && $pid == 0) {
+        open STDIN,  '<', '/dev/null';
+        open STDOUT, '>', '/dev/null';
+        open STDERR, '>', '/dev/null';
+        exec { $opener } $opener, $url or POSIX::_exit(127);
+    }
+}
+
+sub sse_msg {
+    my ($e) = @_;
+    return (defined $e->{id} ? "id: $e->{id}\n" : '') . "event: msg\ndata: $e->{json}\n\n";
+}
+
+sub broadcast_sse {
+    my ($text) = @_;
+    for my $c (values %clients) {
+        next unless $c->{sse};
+        $c->{out} .= $text;
+        drop($c) if length $c->{out} > $MAX_OUT;
+    }
+}
+
+sub feed_line {
+    my ($line) = @_;
+    if ($line =~ /\Amsg (\{.*\})\z/) {
+        my $json = $1;
+        my $id;
+        $id = $1 if $json =~ /\A\{"id":"((?:[^"\\]|\\.)*)"/;
+        push @ring, { id => $id, json => $json };
+        shift @ring while @ring > $cap;
+        broadcast_sse(sse_msg($ring[-1]));
+    }
+    elsif ($line =~ /\Astore (".*")\z/) { $store = $1 }
+    elsif ($line =~ /\Aclaims (\[.*\])\z/) {
+        $claims = $1;
+        broadcast_sse("event: claims\ndata: $claims\n\n");
+    }
+    elsif ($line =~ /\Asessions (\[.*\])\z/) {
+        $sessions = $1;
+        broadcast_sse("event: sessions\ndata: $sessions\n\n");
+    }
+    # tick, and anything unknown: ignored
+}
+
+sub read_stdin {
+    my $n = sysread(STDIN, my $buf, 65536);
+    return if !defined $n && ($! == EAGAIN || $! == EINTR);
+    exit 0 if !$n;    # the feed ended, or failed: nothing left to serve
+    $in_buf .= $buf;
+    while ((my $nl = index($in_buf, "\n")) >= 0) {
+        my $line = substr($in_buf, 0, $nl + 1, '');
+        chomp $line;
+        feed_line($line);
+    }
+}
+
+sub drop {
+    my ($c) = @_;
+    my $fd = fileno($c->{sock});
+    return unless defined $fd && delete $clients{$fd};
+    close($c->{sock});
+}
+
+sub respond {
+    my ($c, $code, $type, $body, $extra) = @_;
+    $c->{out} .= "HTTP/1.1 $code $REASON{$code}\r\n"
+        . "Content-Type: $type\r\n"
+        . "Content-Length: " . length($body) . "\r\n"
+        . "Cache-Control: no-store\r\n"
+        . "Content-Security-Policy: $CSP\r\n"
+        . "X-Content-Type-Options: nosniff\r\n"
+        . "Connection: close\r\n"
+        . ($extra // '') . "\r\n"
+        . $body;
+    $c->{closing} = 1;
+}
+
+sub start_sse {
+    my ($c, $last_id, $query) = @_;
+    my $n = $cap;
+    $n = $1 if $query =~ /(?:\A|&)n=(\d+)/;
+    $n = 1 if $n < 1;
+    $n = $cap if $n > $cap;
+    my $start;
+    if (defined $last_id && length $last_id) {
+        for my $i (reverse 0 .. $#ring) {
+            if (defined $ring[$i]{id} && $ring[$i]{id} eq $last_id) { $start = $i + 1; last }
+        }
+    }
+    my $from = defined $start ? $start : (@ring - $n < 0 ? 0 : @ring - $n);
+    $c->{sse} = 1;
+    $c->{out} .= "HTTP/1.1 200 OK\r\n"
+        . "Content-Type: text/event-stream\r\n"
+        . "Cache-Control: no-cache\r\n"
+        . "Content-Security-Policy: $CSP\r\n"
+        . "X-Content-Type-Options: nosniff\r\n"
+        . "Connection: keep-alive\r\n\r\n";
+    $c->{out} .= "event: store\ndata: $store\n\n"
+        . "event: claims\ndata: $claims\n\n"
+        . "event: sessions\ndata: $sessions\n\n";
+    $c->{out} .= sse_msg($_) for @ring[$from .. $#ring];
+}
+
+sub handle_request {
+    my ($c) = @_;
+    my ($head) = $c->{in} =~ /\A(.*?)\r?\n\r?\n/s;
+    my @lines = split /\r?\n/, $head;
+    my ($method, $target) = split ' ', (shift(@lines) // '');
+    my %h;
+    for (@lines) { $h{lc $1} = $2 if /^([^:\s]+):\s*(.*?)\s*$/ }
+    $method //= '';
+    $target //= '';
+    my $host = $h{host} // '';
+    return respond($c, 403, 'text/plain; charset=utf-8', "forbidden\n")
+        unless $host eq "127.0.0.1:$port" || $host eq "localhost:$port";
+    return respond($c, 405, 'text/plain; charset=utf-8', "method not allowed\n", "Allow: GET\r\n")
+        unless $method eq 'GET';
+    my ($path, $query) = ($target =~ /\A([^?]*)(?:\?(.*))?\z/s);
+    $query //= '';
+    if ($path eq '/') { respond($c, 200, 'text/html; charset=utf-8', $PAGE) }
+    elsif ($path eq '/app.js') { respond($c, 200, 'text/javascript; charset=utf-8', $APP_JS) }
+    elsif ($path eq '/events') { start_sse($c, $h{'last-event-id'}, $query) }
+    else { respond($c, 404, 'text/plain; charset=utf-8', "not found\n") }
+}
+
+sub read_client {
+    my ($c) = @_;
+    my $n = sysread($c->{sock}, my $buf, 4096);
+    if (!defined $n) { return if $! == EAGAIN || $! == EINTR; return drop($c) }
+    return drop($c) if $n == 0;
+    return if $c->{sse} || $c->{closing};    # SSE clients send nothing we use
+    $c->{in} .= $buf;
+    if ($c->{in} =~ /\r?\n\r?\n/) { handle_request($c) }
+    elsif (length $c->{in} > 8192) { respond($c, 400, 'text/plain; charset=utf-8', "bad request\n") }
+}
+
+sub flush_client {
+    my ($c) = @_;
+    return unless length $c->{out};
+    my $n = syswrite($c->{sock}, $c->{out});
+    if (!defined $n) { return if $! == EAGAIN || $! == EINTR; return drop($c) }
+    substr($c->{out}, 0, $n, '');
+}
+
+sub accept_client {
+    my $s = $listen->accept or return;
+    $s->blocking(0);
+    $clients{fileno($s)} = { sock => $s, in => '', out => '', sse => 0, closing => 0 };
+}
+
+# The page and its script. ASCII only: Content-Length counts characters.
+$PAGE = <<'HTML';
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agentlog</title>
+<style>
+:root {
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  --muted: #7d849c; --second: #a9afc6; --title: #8b92ab; --text: #eef0f7;
+  --panel: rgba(15, 20, 38, .92); --line: rgba(255, 255, 255, .12); --row: rgba(255, 255, 255, .06);
+  --coral: #ff7a59;
+}
+html { background-color: #0b1020; }
+body {
+  margin: 0; padding: 16px; min-height: 100vh; box-sizing: border-box; color: var(--text);
+  font-family: var(--sans); font-size: 15px; line-height: 1.45;
+  background-color: #0b1020;
+  background-image:
+    radial-gradient(ellipse 45% 45% at 85% 85%, rgba(255, 122, 89, .22), rgba(255, 122, 89, 0)),
+    radial-gradient(ellipse 50% 50% at 20% 25%, rgba(124, 92, 255, .35), rgba(124, 92, 255, 0)),
+    radial-gradient(rgba(255, 255, 255, .06) 1.2px, transparent 1.3px),
+    linear-gradient(135deg, #0b1020 0%, #151036 55%, #22103a 100%);
+  background-size: auto, auto, 28px 28px, auto;
+  background-attachment: fixed;
+}
+.layout { display: grid; gap: 18px; grid-template-columns: minmax(0, 1fr); max-width: 1280px; margin: 0 auto; min-width: 0; }
+.left { display: grid; gap: 18px; align-content: start; min-width: 0; }
+.msgpanel { display: flex; flex-direction: column; min-width: 0; max-height: 75vh; }
+.msgpanel .scroll { flex: 1; min-height: 0; min-width: 0; overflow-x: hidden; overflow-y: auto; }
+@media (min-width: 1100px) {
+  .layout { grid-template-columns: minmax(480px, 44%) minmax(0, 1fr); align-items: start; }
+  .msgpanel { height: calc(100vh - 32px); max-height: none; position: sticky; top: 16px; }
+}
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; min-width: 0; }
+.wordmark {
+  margin: 0; font-family: var(--mono); font-weight: 700; font-size: 40px; letter-spacing: -0.04em; line-height: 1.1;
+  background: linear-gradient(90deg, #ffffff, #c9b8ff); -webkit-background-clip: text; background-clip: text;
+  color: transparent; -webkit-text-fill-color: transparent;
+}
+.cursor { color: var(--coral); -webkit-text-fill-color: var(--coral); font-weight: 400; animation: blink 1.1s steps(1) infinite; }
+.pill {
+  display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 999px;
+  background: rgba(255, 255, 255, .08); border: 1px solid rgba(255, 255, 255, .14);
+  font-family: var(--mono); font-size: 13px; color: #d7dbe8;
+}
+.dot { display: inline-block; flex: none; width: 9px; height: 9px; border-radius: 50%; background: #5b6279; }
+.dot.on, .dot.live { background: #4ade80; animation: pulse 1.6s ease-in-out infinite; }
+.dot.off { background: #ff5f57; animation: none; }
+.counts { font-family: var(--mono); font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+.panel {
+  min-width: 0; overflow: hidden; background: var(--panel); border: 1px solid var(--line); border-radius: 18px;
+  box-shadow: 0 18px 44px rgba(0, 0, 0, .45);
+}
+.bar {
+  position: relative; display: flex; align-items: center; height: 36px; padding: 0 14px;
+  background: rgba(255, 255, 255, .05); font-family: var(--mono); font-size: 13px; color: var(--title);
+}
+.lights { display: flex; gap: 6px; flex: none; }
+.lights i { display: block; width: 12px; height: 12px; border-radius: 50%; }
+.lights .r { background: #ff5f57; } .lights .y { background: #febc2e; } .lights .g { background: #28c840; }
+.bar .title {
+  position: absolute; left: 0; right: 0; text-align: center; padding: 0 90px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.bar .live { position: absolute; right: 14px; top: 50%; margin-top: -4px; }
+.tbl { width: 100%; border-collapse: collapse; table-layout: fixed; font-family: var(--mono); font-size: 12px; }
+/* Claims: the copy column is a fixed 32px; the rest share the remaining width (shares sum to 1). */
+.tbl col.c-owner { width: calc((100% - 32px) * 0.247); } .tbl col.c-branch { width: calc((100% - 32px) * 0.186); }
+.tbl col.c-paths { width: calc((100% - 32px) * 0.268); } .tbl col.c-desc { width: calc((100% - 32px) * 0.227); }
+.tbl col.c-left { width: calc((100% - 32px) * 0.072); } .tbl col.c-copy { width: 32px; }
+.tbl th { text-align: left; color: var(--muted); font-weight: 600; padding: 6px 8px; white-space: nowrap; overflow: hidden; }
+.tbl td {
+  text-align: left; vertical-align: middle; color: var(--second); padding: 6px 8px; min-width: 0;
+  border-top: 1px solid var(--row); line-height: 1.25; white-space: nowrap; overflow: hidden;
+}
+.tbl tr.stale { opacity: .45; }
+.ell { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.own { font-weight: 600; }
+.own-line { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.own-sub { color: var(--second); }
+.agent-dot { display: inline-block; flex: none; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+.paths-clamp {
+  flex: 1 1 100%; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden; overflow-wrap: anywhere; min-width: 0;
+}
+.paths-clamp.open { display: block; overflow: visible; }
+.show-all {
+  flex: none; font: 11px/1.2 var(--mono); color: var(--muted); background: none; border: 0; padding: 0;
+  cursor: pointer; text-decoration: underline;
+}
+.show-all:hover { color: var(--text); }
+.show-all:focus-visible { outline: 2px solid var(--coral); outline-offset: 2px; }
+.cell-ell { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.more { color: var(--muted); margin-left: 4px; }
+.wrap-path { display: block; overflow-wrap: anywhere; }
+.nowrap { white-space: nowrap; }
+.tag { color: var(--muted); font-size: 10px; border: 1px solid var(--line); border-radius: 6px; padding: 0 4px; margin-left: 4px; }
+.empty { padding: 12px; color: var(--muted); font-family: var(--mono); font-size: 13px; }
+.scroll { padding: 12px; }
+.msgs { list-style: none; margin: 0; padding: 0; min-width: 0; }
+.msg {
+  position: relative; display: grid; grid-template-columns: 40px minmax(0, 1fr); column-gap: 12px;
+  align-items: start; min-width: 0; padding: 12px 14px 12px 12px; margin: 0 0 10px; border-radius: 13px;
+  background: rgba(255, 255, 255, .045); border: 1px solid transparent;
+}
+.avatar { grid-column: 1; grid-row: 1; align-self: start; width: 40px; height: 44px; overflow: visible; }
+.content { grid-column: 2; grid-row: 1; min-width: 0; display: grid; gap: 4px; }
+.content > * { min-width: 0; }
+.row1 {
+  display: flex; flex-wrap: nowrap; align-items: baseline; gap: 2px 8px; min-width: 0; overflow: hidden;
+  font-family: var(--mono); font-size: 13.5px; color: var(--muted);
+}
+.row1 > * { flex: none; white-space: nowrap; }
+.row1 .who { font-weight: 700; }
+.row1 .branch { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.row1 .kind { font-weight: 600; }
+.row2 {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; min-width: 0;
+  font-family: var(--mono); font-size: 12px; color: var(--muted);
+}
+.row2 span { overflow-wrap: anywhere; min-width: 0; }
+.row3 { display: flex; align-items: center; gap: 6px; min-width: 0; font-family: var(--mono); font-size: 11px; color: var(--muted); opacity: .85; }
+.row3 .r3t { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.copy {
+  flex: none; font: 12px/1 var(--mono); color: #d7dbe8; padding: 3px 7px; cursor: pointer;
+  background: rgba(255, 255, 255, .08); border: 1px solid rgba(255, 255, 255, .14); border-radius: 999px;
+}
+.copy:hover { background: rgba(255, 255, 255, .14); }
+.copy:focus-visible { outline: 2px solid var(--coral); outline-offset: 2px; }
+.copy.copied { color: #4ade80; border-color: rgba(74, 222, 128, .5); }
+.tbl td.copy-cell { padding: 4px 4px; text-align: center; overflow: visible; }
+.tbl td.copy-cell .copy { padding: 2px 6px; }
+.text {
+  font-family: var(--sans); font-size: 17px; color: var(--text);
+  white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0;
+}
+.msg.request { border-left-width: 3px; }
+.glow { position: absolute; top: 0; right: 0; bottom: 0; left: 0; border-radius: 13px; border: 2px solid; opacity: 0; pointer-events: none; }
+.msg.live .glow { animation: glow 1.5s ease-in-out 1 both; }
+@keyframes blink { 50% { opacity: 0; } }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+@keyframes glow { 0%, 100% { opacity: 0; } 25% { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) {
+  .cursor, .dot.on, .dot.live, .msg.live .glow { animation: none; }
+}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <symbol id="bot" viewBox="-20 -24 40 44">
+    <line x1="0" y1="-14" x2="0" y2="-21" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+    <circle cx="0" cy="-22" r="3" fill="currentColor"/>
+    <rect x="-16" y="-14" width="32" height="28" rx="9" fill="currentColor"/>
+    <circle cx="-6" cy="-1" r="3.6" fill="#0b1020"/>
+    <circle cx="6" cy="-1" r="3.6" fill="#0b1020"/>
+    <rect x="-5" y="7" width="10" height="2.6" rx="1.3" fill="#0b1020" fill-opacity="0.7"/>
+  </symbol>
+</svg>
+<div class="layout">
+  <div class="left">
+    <header>
+      <h1 class="wordmark">agentlog<span class="cursor">&#9613;</span></h1>
+      <span class="pill"><i id="dot" class="dot"></i><span id="pill">0 agents &middot; 1 board</span></span>
+    </header>
+    <div class="counts" id="counts"></div>
+    <section class="panel">
+      <div class="bar"><span class="lights"><i class="r"></i><i class="y"></i><i class="g"></i></span><span class="title">active claims</span></div>
+      <table class="tbl" id="claims">
+        <colgroup><col class="c-owner"><col class="c-branch"><col class="c-paths"><col class="c-desc"><col class="c-left"><col class="c-copy"></colgroup>
+        <thead><tr><th>owner</th><th>branch</th><th>paths</th><th>description</th><th>time left</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+    <section class="panel">
+      <div class="bar"><span class="lights"><i class="r"></i><i class="y"></i><i class="g"></i></span><span class="title">sessions, last 24h</span></div>
+      <table class="tbl" id="sessions">
+        <colgroup><col style="width:24%"><col style="width:18%"><col style="width:36%"><col style="width:22%"></colgroup>
+        <thead><tr><th>owner</th><th>branch</th><th>worktree</th><th>last seen</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+  </div>
+  <section class="panel msgpanel">
+    <div class="bar"><span class="lights"><i class="r"></i><i class="y"></i><i class="g"></i></span><span class="title" id="store">.agentlog/</span><i class="dot live"></i></div>
+    <div class="scroll" id="scroll"><ol class="msgs" id="messages"></ol></div>
+  </section>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>
+HTML
+
+$APP_JS = <<'JS';
+'use strict';
+// Messages kept on the page. ?max= overrides the default of 500.
+const MAX = (function () {
+  const v = parseInt(new URLSearchParams(location.search).get('max'), 10);
+  return v > 0 ? Math.min(v, 1000) : 500;
+})();
+const AGENT_COLORS = { 'claude-code': '#ff8a65', codex: '#34d3b4', muse: '#b69cff', antigravity: '#6cb6ff' };
+const KIND_COLORS = { claim: '#ffd166', request: '#ff6b9a', reply: '#6cb6ff', done: '#4ade80', note: '#c9d1d9', release: '#ffb86b' };
+const FALLBACK = '#c9d1d9';
+const ARROW = '\u2192';
+const CLOCK = '\u23f1';
+const MIDDOT = '\u00b7';
+const COPY_ICON = '\u29c9';
+const CHECK = '\u2713';
+const pageStart = Date.now();
+
+const own = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+const agentColor = (a) => (own(AGENT_COLORS, a) ? AGENT_COLORS[a] : FALLBACK);
+const kindColor = (k) => (own(KIND_COLORS, k) ? KIND_COLORS[k] : FALLBACK);
+const session8 = (s) => String(s || '').slice(0, 8);
+const shortId = (id) => String(id || '').slice(-6);
+const parse = (s) => { try { return JSON.parse(s); } catch (_) { return null; } };
+
+function alpha(hex, a) {
+  const n = parseInt(hex.slice(1), 16);
+  return 'rgba(' + ((n >> 16) & 255) + ',' + ((n >> 8) & 255) + ',' + (n & 255) + ',' + a + ')';
+}
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+function cell(text, cls) {
+  return el('td', cls || null, text == null ? '' : String(text));
+}
+function emptyRow(cols, text) {
+  const tr = el('tr', null, null);
+  const td = el('td', 'empty', text);
+  td.colSpan = cols;
+  tr.appendChild(td);
+  return tr;
+}
+function timeLeft(expires) {
+  if (expires == null) return 'no expiry';
+  const mins = Math.floor((expires * 1000 - Date.now()) / 60000);
+  return mins > 0 ? mins + 'm left' : 'expired';
+}
+function avatar(color) {
+  const NS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('class', 'avatar');
+  svg.setAttribute('viewBox', '0 0 40 44');
+  svg.setAttribute('width', '40');
+  svg.setAttribute('height', '44');
+  svg.setAttribute('aria-hidden', 'true');
+  svg.style.color = color;
+  const use = document.createElementNS(NS, 'use');
+  use.setAttribute('href', '#bot');
+  // The symbol's own viewBox does the offset, as in the hero.
+  use.setAttribute('x', '0');
+  use.setAttribute('y', '0');
+  use.setAttribute('width', '40');
+  use.setAttribute('height', '44');
+  svg.appendChild(use);
+  return svg;
+}
+
+// Copy an id. The button shows a check for 1.2s. If the clipboard is refused,
+// the id is selected in a hidden read-only input so the user can press Ctrl/Cmd+C.
+let fallbackInput = null;
+function selectForCopy(text) {
+  if (!fallbackInput) {
+    fallbackInput = el('input', null, null);
+    fallbackInput.type = 'text';
+    fallbackInput.readOnly = true;
+    fallbackInput.tabIndex = -1;
+    fallbackInput.setAttribute('aria-hidden', 'true');
+    fallbackInput.style.cssText = 'position:fixed;left:0;top:0;width:1px;height:1px;opacity:0;';
+    document.body.appendChild(fallbackInput);
+  }
+  fallbackInput.value = text;
+  fallbackInput.focus();
+  fallbackInput.select();
+}
+// Ids whose copy button shows the check mark, id -> timer. A table re-render
+// rebuilds the buttons, so the state lives here and every button for an id follows it.
+const flashing = new Map();
+function paintCopy(id) {
+  const on = flashing.has(id);
+  document.querySelectorAll('button.copy').forEach((b) => {
+    if (b.title !== id) return;
+    b.textContent = on ? CHECK : COPY_ICON;
+    b.classList.toggle('copied', on);
+  });
+}
+function copyButton(id, label) {
+  const btn = el('button', 'copy', flashing.has(id) ? CHECK : COPY_ICON);
+  if (flashing.has(id)) btn.classList.add('copied');
+  btn.type = 'button';
+  btn.setAttribute('aria-label', label);
+  btn.title = id;
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const flash = () => {
+      clearTimeout(flashing.get(id));
+      flashing.set(id, setTimeout(() => { flashing.delete(id); paintCopy(id); }, 1200));
+      paintCopy(id);
+    };
+    const fail = () => selectForCopy(id);
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(id).then(flash, fail);
+    } else {
+      fail();
+    }
+  });
+  return btn;
+}
+
+// Owner: agent in its colour, then :session8 muted, all on one line.
+function ownerCell(agent, session, stale) {
+  const td = el('td', null, null);
+  td.title = (agent || '?') + ':' + (session || '');
+  const line = el('span', 'own-line', null);
+  const dotEl = el('span', 'agent-dot', null);
+  dotEl.style.background = agentColor(agent);
+  const sub = el('span', 'own-sub', session8(session));
+  line.append(dotEl, sub);
+  if (stale) line.appendChild(el('span', 'tag', 'stale'));
+  td.appendChild(line);
+  return td;
+}
+// One line with an ellipsis; the full value goes in the title.
+function ellCell(text) {
+  const s = text == null ? '' : String(text);
+  const td = el('td', null, null);
+  td.title = s;
+  td.appendChild(el('span', 'cell-ell', s));
+  return td;
+}
+// First path, then a muted +N when there are more. The title holds the full list.
+function pathsCell(paths) {
+  const list = String(paths || '').split(/[ ,]+/).filter(Boolean);
+  const td = el('td', null, null);
+  td.title = list.join(' ');
+  const line = el('span', 'cell-ell', list[0] || '');
+  if (list.length > 1) line.appendChild(el('span', 'more', '+' + (list.length - 1)));
+  td.appendChild(line);
+  return td;
+}
+
+const list = document.getElementById('messages');
+const scroller = document.getElementById('scroll');
+const seenIds = new Set();
+let claims = [];
+let sessions = [];
+
+function updateCounts() {
+  const agents = new Set(sessions.map((s) => s.agent)).size;
+  document.getElementById('pill').textContent =
+    agents + (agents === 1 ? ' agent' : ' agents') + ' ' + MIDDOT + ' 1 board';
+  document.getElementById('counts').textContent =
+    claims.length + ' active claims ' + MIDDOT + ' ' + sessions.length + ' sessions (24h) ' + MIDDOT + ' ' +
+    list.children.length + ' messages';
+}
+
+function renderClaims() {
+  const body = document.querySelector('#claims tbody');
+  body.replaceChildren();
+  if (!claims.length) body.appendChild(emptyRow(6, 'no active claims'));
+  for (const c of claims) {
+    const row = el('tr', null, null);
+    row.title = c.id || '';
+    const copy = el('td', 'copy-cell', null);
+    copy.appendChild(copyButton(c.id || '', 'Copy claim ID'));
+    row.append(
+      ownerCell(c.agent, c.session, false),
+      ellCell(c.branch),
+      pathsCell(c.paths),
+      ellCell(String(c.body || '').split('\n')[0]),
+      ellCell(timeLeft(c.expires)),
+      copy);
+    body.appendChild(row);
+  }
+  updateCounts();
+}
+
+function renderSessions() {
+  const body = document.querySelector('#sessions tbody');
+  body.replaceChildren();
+  if (!sessions.length) body.appendChild(emptyRow(4, 'no sessions'));
+  for (const s of sessions) {
+    const row = el('tr', s.stale ? 'stale' : null, null);
+    row.append(
+      ownerCell(s.agent, s.session, !!s.stale),
+      ellCell(s.branch),
+      ellCell(s.worktree),
+      ellCell(s.seen));
+    body.appendChild(row);
+  }
+  updateCounts();
+}
+
+// "+ show all" appears only while the paths are clamped to two lines. The clamp
+// depends on the width, so refreshClamps runs again after a resize.
+function clampToggle(li) {
+  const pathsEl = li.querySelector('.paths-clamp');
+  if (!pathsEl) return;
+  const next = pathsEl.nextElementSibling;
+  const existing = next && next.classList.contains('show-all') ? next : null;
+  const clamped = pathsEl.classList.contains('open') || pathsEl.scrollHeight > pathsEl.clientHeight;
+  if (clamped && !existing) {
+    const toggle = el('button', 'show-all', '+ show all');
+    toggle.type = 'button';
+    toggle.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const open = pathsEl.classList.toggle('open');
+      toggle.textContent = open ? 'show less' : '+ show all';
+    });
+    pathsEl.after(toggle);
+  } else if (!clamped && existing) {
+    existing.remove();
+    pathsEl.classList.remove('open');
+  }
+}
+function refreshClamps() {
+  for (const li of list.children) clampToggle(li);
+}
+let resizeTimer = null;
+window.addEventListener('resize', () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(refreshClamps, 150);
+});
+
+function addMessage(m) {
+  if (m.id && seenIds.has(m.id)) return;   // replayed after a reconnect
+  const agent = m.agent || 'unknown';
+  const color = agentColor(agent);
+  const kind = m.kind || '?';
+  const li = el('li', 'msg', null);
+  // Live means it was written after this page loaded; backlog never glows.
+  if (Date.parse(m.date) >= pageStart - 2000) li.classList.add('live');
+  if (m.id) li.dataset.id = m.id;
+  li.style.borderColor = alpha(color, 0.35);
+  if (kind === 'request') li.style.borderLeft = '3px solid ' + KIND_COLORS.request;
+
+  const glow = el('span', 'glow', null);
+  glow.style.background = alpha(color, 0.08);
+  glow.style.borderColor = color;
+  li.append(glow, avatar(color));
+
+  const content = el('div', 'content', null);
+  // Row 1: agent:session8 @branch kind -> to
+  const row1 = el('div', 'row1', null);
+  const who = el('span', 'who', agent);
+  who.style.color = color;
+  row1.append(who, el('span', null, ':' + session8(m.session)));
+  if (m.branch && m.branch !== '-') {
+    const br = el('span', 'branch', '@' + m.branch);
+    br.title = m.branch;
+    row1.appendChild(br);
+  }
+  const kindEl = el('span', 'kind', kind);
+  kindEl.style.color = kindColor(kind);
+  row1.appendChild(kindEl);
+  if (m.to && m.to !== '*') row1.appendChild(el('span', null, ARROW + ' ' + m.to));
+  content.appendChild(row1);
+  // Row 2: paths, time left, re= (wraps)
+  const row2Items = [];
+  if (m.paths) {
+    const pathsEl = el('span', 'paths-clamp', m.paths);
+    pathsEl.title = m.paths;
+    row2Items.push(pathsEl);
+  }
+  if (kind === 'claim' && m.expires != null) row2Items.push(el('span', null, CLOCK + ' ' + timeLeft(m.expires)));
+  if (m.re) row2Items.push(el('span', null, 're=' + m.re));
+  if (row2Items.length) {
+    const row2 = el('div', 'row2', null);
+    row2.append(...row2Items);
+    content.appendChild(row2);
+  }
+  // Row 3: date and the last 6 characters of the id, with a copy button
+  const row3 = el('div', 'row3', null);
+  row3.appendChild(el('span', 'r3t', (m.date || '') + '  ' + shortId(m.id)));
+  if (m.id) row3.appendChild(copyButton(m.id, 'Copy message ID'));
+  content.appendChild(row3);
+  content.appendChild(el('div', 'text', m.body == null ? '' : m.body));
+  li.appendChild(content);
+
+  const scrolled = scroller.scrollTop > 0;
+  list.prepend(li);
+  clampToggle(li);
+  if (scrolled) scroller.scrollTop += li.offsetHeight;
+  if (m.id) seenIds.add(m.id);
+  while (list.children.length > MAX) {
+    const old = list.lastElementChild;
+    if (old.dataset.id) seenIds.delete(old.dataset.id);
+    old.remove();
+  }
+  updateCounts();
+}
+
+const dot = document.getElementById('dot');
+const es = new EventSource('/events?n=' + MAX);
+es.onopen = () => { dot.className = 'dot on'; };
+es.onerror = () => { dot.className = 'dot off'; };
+es.addEventListener('store', (e) => {
+  const s = parse(e.data);
+  if (typeof s === 'string') document.getElementById('store').textContent = s;
+});
+es.addEventListener('msg', (e) => { const m = parse(e.data); if (m) addMessage(m); });
+es.addEventListener('claims', (e) => {
+  const next = parse(e.data) || [];
+  if (JSON.stringify(next) === JSON.stringify(claims)) return;   // unchanged: keep the rows and their state
+  claims = next;
+  renderClaims();
+});
+es.addEventListener('sessions', (e) => { sessions = parse(e.data) || []; renderSessions(); });
+setInterval(renderClaims, 30000);
+updateCounts();
+JS
+
+while (1) {
+    my @rh = ($listen, \*STDIN);
+    push @rh, $_->{sock} for values %clients;
+    my @wh = map { $_->{sock} } grep { length $_->{out} } values %clients;
+    my ($rr, $ww) = IO::Select->select(IO::Select->new(@rh), IO::Select->new(@wh), undef, 1);
+    for my $h (@{ $rr || [] }) {
+        if ($h == $listen) { accept_client(); next }
+        my $fd = fileno($h);
+        next unless defined $fd;
+        if ($fd == 0) { read_stdin(); next }
+        my $c = $clients{$fd} or next;
+        read_client($c);
+    }
+    for my $h (@{ $ww || [] }) {
+        my $fd = fileno($h);
+        my $c = defined $fd && $clients{$fd} or next;
+        flush_client($c);
+    }
+    for my $c (values %clients) { drop($c) if $c->{closing} && !length $c->{out} }
+    if (time - $last_ping >= 15) {
+        broadcast_sse(": ping\n\n");
+        $last_ping = time;
+    }
+}
+PERL
+}
+
 # ---------------------------------------------------------------- main
 
 [ $# -gt 0 ] || { usage; exit 1; }
@@ -1164,6 +2036,7 @@ case $cmd in
   whoami) printf '%s:%s (session %s)\n' "$AGENT" "$SHORT" "$SESSION" ;;
   gc) cmd_gc "$@" ;;
   sync) cmd_sync "$@" ;;
+  dashboard) cmd_dashboard "$@" ;;
   dir)
     ensure_store
     printf '%s\n' "$STORE"

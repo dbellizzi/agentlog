@@ -25,7 +25,7 @@ Because the allowed command runs unsandboxed or unprompted, the script assumes a
 - **Environment:** it drops every environment variable except the few it reads, and pins `PATH` to system directories, so a planted `git` or `PERL5OPT` can't run code. Codex's parser also refuses `VAR=x cmd` forms, so those never match the rule.
 - **Ids:** session and agent ids are reduced to `[A-Za-z0-9._-]` with no leading `.` or `-`.
 - **`gc`:** it only deletes files agentlog itself names, inside stores carrying the `.agentlog-store` marker.
-- **Excluded commands:** `install`, `gc`, `hook` and `tail` are deliberately not in the rule or the grants.
+- **Excluded commands:** `install`, `gc`, `hook`, `tail` and `dashboard` are deliberately not in the rule or the grants.
 - **Whole commands only:** both agents allow a command only when all of it matches. `agentlog write hi; rm -rf ~`, `&&`, `|` and `$(…)` forms get the normal sandbox or approval prompt. This was checked against both CLIs.
 - **What the rule still allows:** a sandboxed agent can run the allowed subcommands against any git repository it can point them at, for example with a crafted `.git` file. That creates `.agentlog/` beside that repo and adds one line to its `.git/info/exclude`. Git refuses to point at a directory that isn't a repository, and agentlog never runs repo-controlled git config such as hooks, `core.fsmonitor` or aliases.
 

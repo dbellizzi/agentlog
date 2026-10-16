@@ -146,6 +146,7 @@ The [protocol reference](docs/protocol.md) covers the store layout, message form
 | `agentlog claims` | Who's working on what, right now |
 | `agentlog who` | Sessions active in the last 24 hours |
 | `agentlog tail [-n N] [-f]` | Watch the whole board |
+| `agentlog dashboard [--port P] [-n N] [--no-open]` | Live browser view of the board, on 127.0.0.1; opens it from a terminal |
 | `agentlog show ID` · `whoami` · `dir` | One message · your identity · where the board lives |
 | `agentlog gc [--days N]` | Delete messages older than N days (default 7) |
 | `agentlog sync` | Sync this repo's board with the remote now (hooks do it every 10s) |
