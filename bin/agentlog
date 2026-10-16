@@ -1502,13 +1502,47 @@ body {
   background-size: auto, auto, 28px 28px, auto;
   background-attachment: fixed;
 }
-/* Stacked (below 1100px): the page is the only thing that scrolls. Panels never scroll. */
+/* Layout. Wide (1100px and up): the messages beside the left column. Below 1100px:
+   one view at a time under a tab bar; the page never scrolls. */
 .layout { display: grid; gap: 18px; grid-template-columns: minmax(0, 1fr); max-width: 1280px; margin: 0 auto; min-width: 0; }
 .left { display: flex; flex-direction: column; gap: 18px; min-width: 0; }
 .left > .panel { flex: none; }
 .msgpanel { display: flex; flex-direction: column; min-width: 0; }
 .msgpanel .scroll { min-width: 0; overflow: hidden; }
 .tblwrap { overflow: hidden; }
+.tabs { display: none; }
+[hidden] { display: none !important; }
+@media (max-width: 1099px) {
+  body { height: 100vh; height: 100dvh; min-height: 0; overflow: hidden; }
+  .layout { height: 100%; gap: 12px; grid-template-rows: auto auto auto minmax(0, 1fr); }
+  .left { display: contents; }
+  .left > header { grid-row: 1; }
+  .left > .counts { grid-row: 2; }
+  .left > .tabs { grid-row: 3; display: flex; }
+  .left > .panel, .msgpanel { grid-row: 4; min-height: 0; }
+  .claims-panel, .sessions-panel { display: flex; flex-direction: column; }
+  .left > .panel .bar, .msgpanel > .bar { flex: none; }
+  .left > .panel .tblwrap { flex: 1 1 0; min-height: 0; }
+  .msgpanel .scroll { flex: 1 1 0; min-height: 0; }
+  .wordmark { font-size: 28px; }
+}
+/* A narrow message bar: the store path on its own line above the controls. */
+@media (max-width: 559px) {
+  .msgpanel > .bar { flex-wrap: wrap; height: auto; min-height: 36px; padding: 8px 14px; row-gap: 8px; }
+  .msgpanel > .bar .title { order: -1; flex: 1 0 100%; text-align: left; }
+}
+.tabs {
+  gap: 4px; padding: 4px; border-radius: 999px; background: rgba(255, 255, 255, .08); border: 1px solid rgba(255, 255, 255, .14);
+}
+.tab {
+  flex: 1 1 0; min-width: 0; position: relative; display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  padding: 7px 6px; border: 0; border-radius: 999px; background: transparent; cursor: pointer; white-space: nowrap;
+  font: 13px/1 var(--mono); color: var(--muted);
+}
+.tab[aria-selected="true"] { background: rgba(255, 255, 255, .16); color: #eef0f7; }
+.tab .n { font-size: 11px; color: var(--muted); }
+.tab .act { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #ff7a59; }
+.tab:focus-visible { outline: 2px solid var(--coral); outline-offset: 2px; }
 /* Wide (1100px and up): a screen as tall as the viewport. The page never scrolls. */
 @media (min-width: 1100px) {
   body { height: 100vh; min-height: 0; overflow: hidden; }
@@ -1693,7 +1727,12 @@ header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; mi
       <span class="pill"><i id="dot" class="dot"></i><span id="pill">0 agents &middot; 1 board</span></span>
     </header>
     <div class="counts" id="counts"></div>
-    <section class="panel claims-panel">
+    <nav class="tabs" role="tablist" aria-label="Views">
+      <button type="button" class="tab" role="tab" id="tab-log" aria-controls="view-log" aria-selected="true" tabindex="0" data-view="log">Log<i class="act" id="log-act" hidden></i></button>
+      <button type="button" class="tab" role="tab" id="tab-claims" aria-controls="view-claims" aria-selected="false" tabindex="-1" data-view="claims">Claims <span class="n" id="tab-claims-n">0</span></button>
+      <button type="button" class="tab" role="tab" id="tab-sessions" aria-controls="view-sessions" aria-selected="false" tabindex="-1" data-view="sessions">Sessions <span class="n" id="tab-sessions-n">0</span></button>
+    </nav>
+    <section class="panel claims-panel" id="view-claims" role="tabpanel" aria-labelledby="tab-claims">
       <div class="bar"><span class="lights"><i class="r"></i><i class="y"></i><i class="g"></i></span><span class="title">active claims</span><span class="pager" id="claims-pager" hidden></span></div>
       <div class="tblwrap"><table class="tbl" id="claims">
         <colgroup><col class="c-owner"><col class="c-branch"><col class="c-paths"><col class="c-desc"><col class="c-left"><col class="c-copy"></colgroup>
@@ -1701,7 +1740,7 @@ header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; mi
         <tbody></tbody>
       </table></div>
     </section>
-    <section class="panel sessions-panel">
+    <section class="panel sessions-panel" id="view-sessions" role="tabpanel" aria-labelledby="tab-sessions">
       <div class="bar"><span class="lights"><i class="r"></i><i class="y"></i><i class="g"></i></span><span class="title">sessions, last 24h</span><span class="pager" id="sessions-pager" hidden></span></div>
       <div class="tblwrap"><table class="tbl" id="sessions">
         <colgroup><col style="width:24%"><col style="width:18%"><col style="width:36%"><col style="width:22%"></colgroup>
@@ -1710,7 +1749,7 @@ header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; mi
       </table></div>
     </section>
   </div>
-  <section class="panel msgpanel">
+  <section class="panel msgpanel" id="view-log" role="tabpanel" aria-labelledby="tab-log">
     <div class="bar"><span class="lights"><i class="r"></i><i class="y"></i><i class="g"></i></span><span class="title" id="store">.agentlog/</span><span class="player" id="player"></span><i class="dot live" id="livedot"></i></div>
     <div class="scrubrow"><input type="range" class="scrub" id="scrub" min="0" max="0" value="0" aria-label="Message position" disabled><span class="scrub-time" id="scrub-time"></span></div>
     <div class="scroll" id="scroll"><ol class="msgs" id="messages"></ol></div>
@@ -1910,15 +1949,17 @@ function pathsCell(paths) {
 // ---------------------------------------------------------------- tables
 
 const wideQuery = window.matchMedia('(min-width: 1100px)');
+const narrowBarQuery = window.matchMedia('(max-width: 559px)');
 let claims = [];
 let sessions = [];
 const tables = {
   claims: { page: 0, pager: null, cols: 6, empty: 'no active claims', rowH: 28, lastPer: 0 },
   sessions: { page: 0, pager: null, cols: 4, empty: 'no sessions', rowH: 28, lastPer: 0 },
 };
-const STACKED_ROWS = 10;
 
 function updateCounts() {
+  document.getElementById('tab-claims-n').textContent = claims.length;
+  document.getElementById('tab-sessions-n').textContent = sessions.length;
   const agents = new Set(sessions.map((s) => s.agent)).size;
   document.getElementById('pill').textContent =
     agents + (agents === 1 ? ' agent' : ' agents') + ' ' + MIDDOT + ' 1 board';
@@ -1930,10 +1971,10 @@ function updateCounts() {
 // Rows that fit the panel. Wide: the panel body's height over the measured row
 // height. The claims panel is capped at 40% of the column (see the CSS).
 function rowsPerPage(key) {
-  if (!wideQuery.matches) return STACKED_ROWS;
   const panel = document.querySelector('#' + key).closest('.panel');
-  const left = document.querySelector('.left');
-  const panelH = key === 'claims' ? left.clientHeight * 0.4 : panel.clientHeight;
+  if (panel.hidden) return tables[key].lastPer || 1;
+  // Wide: the claims panel is capped at 40% of the column. Below 1100px the view fills the area.
+  const panelH = key === 'claims' && wideQuery.matches ? document.querySelector('.left').clientHeight * 0.4 : panel.clientHeight;
   const bodyH = panelH - panel.querySelector('.bar').offsetHeight - panel.querySelector('thead').offsetHeight - 2;
   return Math.max(1, Math.floor(bodyH / tables[key].rowH));
 }
@@ -2030,7 +2071,6 @@ function clampToggle(li, id) {
 
 const scroller = document.getElementById('scroll');
 const list = document.getElementById('messages');
-const WINDOW_STACKED = 15;     // cards per window below 1100px
 const STEP_MS = 700;           // play speed: one message per step
 const buffer = [];             // { m, glow }, oldest first, at most MAX
 const ids = new Set();
@@ -2159,17 +2199,15 @@ function render() {
   renderQueued = false;
   const last = newest();
   const top = curPos();
-  const wide = wideQuery.matches;
-  const limit = wide ? scroller.clientHeight - 24 : Infinity;   // .scroll has 12px padding
+  const limit = scroller.clientHeight - 24;   // .scroll has 12px padding; 0 while the view is hidden
   list.replaceChildren();
   let shown = 0;
-  for (let i = top; i >= 0 && last >= 0; i--) {
-    if (!wide && shown >= WINDOW_STACKED) break;
+  for (let i = top; i >= 0 && last >= 0 && limit > 0; i--) {
     const li = buildCard(buffer[i]);
     list.appendChild(li);
     clampToggle(li, buffer[i].m.id);
     shown += 1;
-    if (wide && list.offsetHeight > limit) {
+    if (list.offsetHeight > limit) {
       if (shown === 1) {
         li.classList.add('clip');
         li.style.maxHeight = Math.max(80, limit) + 'px';
@@ -2226,6 +2264,7 @@ function addMessage(m) {
   }
   if (mode === 'live') pos = newest();
   if (mode === 'paused') pending += 1;
+  if (fresh && !wideQuery.matches && view !== 'log') document.getElementById('log-act').hidden = false;
   if (mode === 'live') scheduleRender(); else render();   // a few arrivals while paused redraw at once; a live flood batches
 }
 
@@ -2257,6 +2296,8 @@ document.getElementById('scrub').addEventListener('input', (e) => pauseAt(Number
 document.addEventListener('keydown', (e) => {
   const t = e.target;
   if (t && (t.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(t.tagName))) return;
+  if (t && t.closest && t.closest('.tabs')) return;   // the tabs use the arrows
+  if (!wideQuery.matches && view !== 'log') return;   // the player is not on screen
   if (e.altKey || e.ctrlKey || e.metaKey) return;
   if (e.key === 'ArrowLeft') { e.preventDefault(); step(-1); }
   else if (e.key === 'ArrowRight') { e.preventDefault(); step(1); }
@@ -2298,19 +2339,87 @@ if (window.ResizeObserver) new ResizeObserver(relayout).observe(document.querySe
 // Resize events and observers also wait for a frame, so a timer checks the measures
 // too: a page size that changed, the breakpoint, or the height of the message window.
 let lastWide = wideQuery.matches;
+let lastBar = narrowBarQuery.matches;
 let lastScrollH = -1;
 setInterval(() => {
+  if (narrowBarQuery.matches !== lastBar) {
+    lastBar = narrowBarQuery.matches;
+    renderStore();
+  }
+  if (wideQuery.matches !== lastWide) {
+    lastWide = wideQuery.matches;
+    if (!lastWide) view = viewFromHash();
+    applyLayout();
+  }
   for (const key of ['claims', 'sessions']) {
     if (rowsPerPage(key) !== tables[key].lastPer) renderTable(key);
   }
-  if (wideQuery.matches !== lastWide || scroller.clientHeight !== lastScrollH) {
-    lastWide = wideQuery.matches;
+  if (scroller.clientHeight !== lastScrollH) {
     lastScrollH = scroller.clientHeight;
     scheduleRender();
   }
 }, 400);
+// ---------------------------------------------------------------- views
+
+// Below 1100px one view shows at a time: Log (the player), Claims or Sessions, picked
+// with the tabs and kept in the URL hash. At 1100px and up all three show.
+const VIEWS = ['log', 'claims', 'sessions'];
+let view = 'log';
+let storePath = '.agentlog/';
+function viewFromHash() {
+  const h = location.hash.slice(1);
+  return VIEWS.includes(h) ? h : 'log';
+}
+function shortPath(p) {
+  const parts = String(p).split('/').filter(Boolean);
+  return parts.length > 2 ? parts.slice(-2).join('/') : String(p);
+}
+function renderStore() {
+  const st = document.getElementById('store');
+  st.textContent = narrowBarQuery.matches ? shortPath(storePath) : storePath;
+  st.title = storePath;
+}
+function applyLayout() {
+  const wide = wideQuery.matches;
+  for (const v of VIEWS) {
+    const panel = document.getElementById('view-' + v);
+    const tab = document.getElementById('tab-' + v);
+    panel.hidden = !wide && v !== view;
+    tab.setAttribute('aria-selected', String(v === view));
+    tab.tabIndex = v === view ? 0 : -1;
+  }
+  if (!wide && view === 'log') document.getElementById('log-act').hidden = true;
+  renderStore();
+  renderTable('claims');
+  renderTable('sessions');
+  scheduleRender();
+}
+function setView(v) {
+  view = v;
+  if (!wideQuery.matches && location.hash !== '#' + v) history.replaceState(null, '', '#' + v);
+  applyLayout();
+}
+for (const v of VIEWS) {
+  document.getElementById('tab-' + v).addEventListener('click', () => setView(v));
+}
+document.querySelector('.tabs').addEventListener('keydown', (e) => {
+  if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+  e.preventDefault();
+  const i = VIEWS.indexOf(e.target.dataset.view);
+  const next = VIEWS[(i + (e.key === 'ArrowRight' ? 1 : VIEWS.length - 1)) % VIEWS.length];
+  setView(next);
+  document.getElementById('tab-' + next).focus();
+});
+window.addEventListener('hashchange', () => {
+  if (wideQuery.matches) return;
+  view = viewFromHash();
+  applyLayout();
+});
+
 buildPager('claims');
 buildPager('sessions');
+view = viewFromHash();
+applyLayout();
 renderTable('claims');
 renderTable('sessions');
 scheduleRender();
@@ -2320,7 +2429,7 @@ es.onopen = () => { dot.className = 'dot on'; };
 es.onerror = () => { dot.className = 'dot off'; };
 es.addEventListener('store', (e) => {
   const s = parse(e.data);
-  if (typeof s === 'string') document.getElementById('store').textContent = s;
+  if (typeof s === 'string') { storePath = s; renderStore(); }
 });
 es.addEventListener('msg', (e) => { const m = parse(e.data); if (m) addMessage(m); });
 es.addEventListener('claims', (e) => {
