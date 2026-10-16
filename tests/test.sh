@@ -479,6 +479,12 @@ c=$(run codex bbbb2222 write -k claim -p 'dash/**' "dash claim" 2>/dev/null)
 m3=$(run claude-code aaaa1111 write "dash third")
 exp3=$(printf '%s\n%s' "$c" "$m3")
 exp4=$(printf '%s\n%s\n%s\n%s' "$ml" "$m2" "$c" "$m3")
+# Temp files that atomic_write leaves in sessions/ are not records. One is a
+# valid record under a fake session id (must be ignored); one is unreadable (its
+# presence must not make any reader print an error).
+printf 'agent=codex\nsession=ffff0000-hidden\nbranch=x\nworktree=/x\nhost=h\nseen=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$AGENTLOG_DIR/sessions/.w.test.hidden"
+printf 'agent=codex\nsession=ffff0001-locked\n' >"$AGENTLOG_DIR/sessions/.w.test.locked"
+chmod 000 "$AGENTLOG_DIR/sessions/.w.test.locked"
 # The dashboard runs as codex bbbb2222; its presence and cursor must not move.
 run codex bbbb2222 read --peek >/dev/null
 touch -t 202001010000 "$AGENTLOG_DIR/seen/bbbb2222" "$AGENTLOG_DIR/sessions/bbbb2222"
@@ -493,6 +499,11 @@ DBASE=$(sed -n 's|^agentlog: dashboard at \(http://127\.0\.0\.1:[0-9]*\)/ .*|\1|
 DPORT=${DBASE##*:}
 check "dashboard: starts and prints its URL despite PERL5OPT and PERL5LIB" '[ -n "$DBASE" ]'
 check "dashboard: outside a terminal perl gets no opener to run" 'dash_perl_gets_no_opener "$DPID"'
+run codex bbbb2222 who >/dev/null 2>"$dt/who.err"
+check "who: skips hidden temp session files, and prints no errors for them" '! run codex bbbb2222 who 2>/dev/null | grep -q ffff0000 && [ ! -s "$dt/who.err" ]'
+dash_get "$dt/hid" "/events?n=1"
+check "dashboard: its sessions event skips hidden temp session files" 'grep -q "^event: sessions" "$dt/hid" && ! grep -q ffff0000 "$dt/hid"'
+check "dashboard: no store-race noise on stderr after several polls" '[ ! -s "$dt/err" ]'
 i=0; while [ $i -lt 60 ] && ! { dash_claims | grep -qF "$c" && grep -qF "$m3" "$dt/snap"; }; do sleep 0.2; i=$((i + 1)); done
 
 check "dashboard: GET / is the page, with the CSP header" 'dash_csp_ok && [ "$(http_code "$DBASE/")" = 200 ]'

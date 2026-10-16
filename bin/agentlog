@@ -578,10 +578,12 @@ cmd_claims() {
 }
 
 # Presence records written in the last day, across every store. `who` and the
-# dashboard both read sessions through this walk.
+# dashboard both read sessions through this walk. Hidden files are skipped:
+# they are atomic_write's temp files, not records, and another process may
+# rename them away while a reader is reading.
 session_files() {
   stores | while IFS= read -r st; do
-    [ -d "$st/sessions" ] && find "$st/sessions" -type f -mtime -1
+    [ -d "$st/sessions" ] && find "$st/sessions" -type f ! -name '.*' -mtime -1
   done
 }
 
@@ -1168,14 +1170,16 @@ json_array() { awk 'BEGIN { printf "[" } NR > 1 { printf "," } { printf "%s", $0
 # hooked (via=hook) and was last seen more than STALE_MIN minutes ago.
 sessions_tsv() {
   session_files | while IFS= read -r f; do
+    # A session can end between the find and this read: skip it, quietly.
+    [ -f "$f" ] || continue
     stale=0
-    if grep -qsx 'via=hook' "$f" && [ -n "$(find "$f" -prune -mmin +"$STALE_MIN")" ]; then stale=1; fi
+    if grep -qsx 'via=hook' "$f" && [ -n "$(find "$f" -prune -mmin +"$STALE_MIN" 2>/dev/null)" ]; then stale=1; fi
     awk -F= -v stale="$stale" '
       { v[$1] = substr($0, length($1) + 2) }
       END {
         if (v["ended"] == "" && v["session"] != "")
           printf "%s\t%s\t%s\t%s\t%s\t%s\n", v["seen"], v["session"], v["agent"], v["branch"], v["worktree"], stale
-      }' "$f"
+      }' "$f" 2>/dev/null || :
   done | sort -r | awk -F '\t' '!u[$2]++'
 }
 
