@@ -1624,6 +1624,12 @@ header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; mi
 .tbl col.c-owner { width: calc((100% - 32px) * 0.247); } .tbl col.c-branch { width: calc((100% - 32px) * 0.186); }
 .tbl col.c-paths { width: calc((100% - 32px) * 0.268); } .tbl col.c-desc { width: calc((100% - 32px) * 0.227); }
 .tbl col.c-left { width: calc((100% - 32px) * 0.072); } .tbl col.c-copy { width: 32px; }
+.tbl col.s-owner { width: 24%; } .tbl col.s-branch { width: 18%; } .tbl col.s-wt { width: 36%; } .tbl col.s-seen { width: 22%; }
+/* Below 560px the sessions table drops the worktree column (it stays in the row title). */
+@media (max-width: 559px) {
+  .tbl col.s-owner { width: 34%; } .tbl col.s-branch { width: 36%; } .tbl col.s-wt { display: none; } .tbl col.s-seen { width: 30%; }
+  .c-wt { display: none; }
+}
 .tbl th { text-align: left; color: var(--muted); font-weight: 600; padding: 6px 8px; white-space: nowrap; overflow: hidden; }
 .tbl td {
   text-align: left; vertical-align: middle; color: var(--second); padding: 6px 8px; min-width: 0;
@@ -1743,8 +1749,8 @@ header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; mi
     <section class="panel sessions-panel" id="view-sessions" role="tabpanel" aria-labelledby="tab-sessions">
       <div class="bar"><span class="lights"><i class="r"></i><i class="y"></i><i class="g"></i></span><span class="title">sessions, last 24h</span><span class="pager" id="sessions-pager" hidden></span></div>
       <div class="tblwrap"><table class="tbl" id="sessions">
-        <colgroup><col style="width:24%"><col style="width:18%"><col style="width:36%"><col style="width:22%"></colgroup>
-        <thead><tr><th>owner</th><th>branch</th><th>worktree</th><th>last seen</th></tr></thead>
+        <colgroup><col class="s-owner"><col class="s-branch"><col class="s-wt"><col class="s-seen"></colgroup>
+        <thead><tr><th>owner</th><th>branch</th><th class="c-wt">worktree</th><th>last seen</th></tr></thead>
         <tbody></tbody>
       </table></div>
     </section>
@@ -1957,15 +1963,19 @@ const tables = {
   sessions: { page: 0, pager: null, cols: 4, empty: 'no sessions', rowH: 28, lastPer: 0 },
 };
 
+// "1 claim", "2 claims": the count and its noun, singular for exactly one.
+function plural(n, one, many) {
+  return n + ' ' + (n === 1 ? one : many);
+}
 function updateCounts() {
   document.getElementById('tab-claims-n').textContent = claims.length;
   document.getElementById('tab-sessions-n').textContent = sessions.length;
   const agents = new Set(sessions.map((s) => s.agent)).size;
-  document.getElementById('pill').textContent =
-    agents + (agents === 1 ? ' agent' : ' agents') + ' ' + MIDDOT + ' 1 board';
+  document.getElementById('pill').textContent = plural(agents, 'agent', 'agents') + ' ' + MIDDOT + ' 1 board';
   document.getElementById('counts').textContent =
-    claims.length + ' active claims ' + MIDDOT + ' ' + sessions.length + ' sessions (24h) ' + MIDDOT + ' ' +
-    buffer.length + ' messages';
+    plural(claims.length, 'active claim', 'active claims') + ' ' + MIDDOT + ' ' +
+    plural(sessions.length, 'session (24h)', 'sessions (24h)') + ' ' + MIDDOT + ' ' +
+    plural(buffer.length, 'message', 'messages');
 }
 
 // Rows that fit the panel. Wide: the panel body's height over the measured row
@@ -1993,13 +2003,31 @@ function claimRow(c) {
     copy);
   return row;
 }
+// "now", "42s ago", "3m ago", "5h ago", "2d ago"; an em dash when the time is missing.
+function relSeen(iso) {
+  const t = Date.parse(iso);
+  if (!iso || isNaN(t)) return '\u2014';
+  const secs = Math.max(0, Math.floor((Date.now() - t) / 1000));
+  if (secs < 5) return 'now';
+  if (secs < 60) return secs + 's ago';
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return mins + 'm ago';
+  const hours = Math.floor(mins / 60);
+  if (hours < 48) return hours + 'h ago';
+  return Math.floor(hours / 24) + 'd ago';
+}
 function sessionRow(s) {
   const row = el('tr', s.stale ? 'stale' : null, null);
+  row.title = s.agent + ':' + (s.session || '') + '\nworktree ' + (s.worktree || '\u2014');
+  const wt = ellCell(s.worktree);
+  wt.classList.add('c-wt');
+  const seen = ellCell(relSeen(s.seen));
+  seen.title = s.seen || '\u2014';
   row.append(
     ownerCell(s.agent, s.session, !!s.stale),
     ellCell(s.branch),
-    ellCell(s.worktree),
-    ellCell(s.seen));
+    wt,
+    seen);
   return row;
 }
 
@@ -2439,7 +2467,7 @@ es.addEventListener('claims', (e) => {
   renderTable('claims');
 });
 es.addEventListener('sessions', (e) => { sessions = parse(e.data) || []; renderTable('sessions'); });
-setInterval(() => renderTable('claims'), 30000);
+setInterval(() => { renderTable('claims'); renderTable('sessions'); }, 30000);
 JS
 
 while (1) {
