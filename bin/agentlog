@@ -1502,15 +1502,14 @@ body {
   background-size: auto, auto, 28px 28px, auto;
   background-attachment: fixed;
 }
-/* Stacked (below 1100px): the window is the only scroller. */
+/* Stacked (below 1100px): the page is the only thing that scrolls. Panels never scroll. */
 .layout { display: grid; gap: 18px; grid-template-columns: minmax(0, 1fr); max-width: 1280px; margin: 0 auto; min-width: 0; }
 .left { display: flex; flex-direction: column; gap: 18px; min-width: 0; }
 .left > .panel { flex: none; }
 .msgpanel { display: flex; flex-direction: column; min-width: 0; }
-.msgpanel .scroll { min-width: 0; overflow: visible; }
-/* The scroll position is adjusted by the script, not by the browser's anchoring. */
-html, .msgpanel .scroll { overflow-anchor: none; }
-/* Wide (1100px and up): a screen as tall as the viewport. Only panels scroll. */
+.msgpanel .scroll { min-width: 0; overflow: hidden; }
+.tblwrap { overflow: hidden; }
+/* Wide (1100px and up): a screen as tall as the viewport. The page never scrolls. */
 @media (min-width: 1100px) {
   body { height: 100vh; min-height: 0; overflow: hidden; }
   .layout { height: 100%; max-width: none; grid-template-columns: minmax(480px, 44%) minmax(0, 1fr); align-items: stretch; }
@@ -1519,9 +1518,9 @@ html, .msgpanel .scroll { overflow-anchor: none; }
   .left > .claims-panel { flex: 0 1 auto; max-height: 40%; min-height: 0; display: flex; flex-direction: column; }
   .left > .sessions-panel { flex: 1 1 0; min-height: 0; display: flex; flex-direction: column; }
   .left > .panel .bar { flex: none; }
-  .left > .panel .tblwrap { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+  .left > .panel .tblwrap { flex: 1 1 0; min-height: 0; }
   .msgpanel { height: 100%; min-height: 0; }
-  .msgpanel .scroll { flex: 1 1 0; min-height: 0; overflow-y: auto; }
+  .msgpanel .scroll { flex: 1 1 0; min-height: 0; }
 }
 header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; min-width: 0; }
 .wordmark {
@@ -1537,6 +1536,7 @@ header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; mi
 }
 .dot { display: inline-block; flex: none; width: 9px; height: 9px; border-radius: 50%; background: #5b6279; }
 .dot.on, .dot.live { background: #4ade80; animation: pulse 1.6s ease-in-out infinite; }
+.dot.paused { background: #ffd166; animation: none; }
 .dot.off { background: #ff5f57; animation: none; }
 .counts { font-family: var(--mono); font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
 .panel {
@@ -1544,28 +1544,57 @@ header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; mi
   box-shadow: 0 18px 44px rgba(0, 0, 0, .45);
 }
 .bar {
-  position: relative; display: flex; align-items: center; height: 36px; padding: 0 14px;
+  position: relative; display: flex; align-items: center; gap: 10px; height: 36px; padding: 0 14px;
   background: rgba(255, 255, 255, .05); font-family: var(--mono); font-size: 13px; color: var(--title);
 }
 .lights { display: flex; gap: 6px; flex: none; }
 .lights i { display: block; width: 12px; height: 12px; border-radius: 50%; }
 .lights .r { background: #ff5f57; } .lights .y { background: #febc2e; } .lights .g { background: #28c840; }
-.bar .title {
-  position: absolute; left: 0; right: 0; text-align: center; padding: 0 90px;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+.bar .title { flex: 1 1 auto; min-width: 0; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bar .live { flex: none; }
+/* Pills: pagers and the message player. */
+.pager { display: inline-flex; align-items: center; gap: 6px; flex: none; font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.pager[hidden] { display: none; }
+.player { display: inline-flex; align-items: center; gap: 5px; flex: none; }
+.pbtn {
+  flex: none; display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 22px; padding: 0;
+  cursor: pointer; color: #d7dbe8; background: rgba(255, 255, 255, .08);
+  border: 1px solid rgba(255, 255, 255, .14); border-radius: 999px;
 }
-.bar .live { position: absolute; right: 14px; top: 50%; margin-top: -4px; }
+.pbtn svg { width: 12px; height: 12px; fill: currentColor; }
+.pbtn:hover:not(:disabled) { background: rgba(255, 255, 255, .14); }
+.pbtn:disabled { opacity: .35; cursor: default; }
+.pbtn:focus-visible { outline: 2px solid var(--coral); outline-offset: 2px; }
+.livewrap { position: relative; display: inline-flex; }
+.pendpill {
+  position: absolute; top: -7px; right: -9px; font: 10px/1 var(--mono); padding: 2px 4px; border-radius: 999px;
+  background: #ffd166; color: #0b1020;
+}
+.pendpill[hidden] { display: none; }
+.modepill { flex: none; font-family: var(--mono); font-size: 11px; padding: 1px 8px; border-radius: 999px; border: 1px solid rgba(74, 222, 128, .5); color: #4ade80; }
+.modepill.paused { color: #ffd166; border-color: rgba(255, 209, 102, .5); }
+.modepill.playing { color: #c9b8ff; border-color: rgba(201, 184, 255, .5); }
+.scrubrow { display: flex; align-items: center; gap: 10px; padding: 9px 14px 0; }
+.scrub {
+  flex: 1 1 auto; min-width: 0; height: 4px; margin: 0; -webkit-appearance: none; appearance: none;
+  background: rgba(255, 255, 255, .1); border-radius: 2px; outline: none;
+}
+.scrub::-webkit-slider-thumb { -webkit-appearance: none; width: 12px; height: 12px; border-radius: 50%; background: #ff7a59; border: 0; cursor: pointer; }
+.scrub::-moz-range-thumb { width: 12px; height: 12px; border-radius: 50%; background: #ff7a59; border: 0; cursor: pointer; }
+.scrub:focus-visible { outline: 2px solid var(--coral); outline-offset: 3px; }
+.scrub:disabled { opacity: .35; }
+.scrub-time { flex: none; font-family: var(--mono); font-size: 11px; color: var(--muted); }
 .tbl { width: 100%; border-collapse: collapse; table-layout: fixed; font-family: var(--mono); font-size: 12px; }
 /* Claims: the copy column is a fixed 32px; the rest share the remaining width (shares sum to 1). */
 .tbl col.c-owner { width: calc((100% - 32px) * 0.247); } .tbl col.c-branch { width: calc((100% - 32px) * 0.186); }
 .tbl col.c-paths { width: calc((100% - 32px) * 0.268); } .tbl col.c-desc { width: calc((100% - 32px) * 0.227); }
 .tbl col.c-left { width: calc((100% - 32px) * 0.072); } .tbl col.c-copy { width: 32px; }
 .tbl th { text-align: left; color: var(--muted); font-weight: 600; padding: 6px 8px; white-space: nowrap; overflow: hidden; }
-.tbl thead th { position: sticky; top: 0; z-index: 1; background: #0f1426; }
 .tbl td {
   text-align: left; vertical-align: middle; color: var(--second); padding: 6px 8px; min-width: 0;
   border-top: 1px solid var(--row); line-height: 1.25; white-space: nowrap; overflow: hidden;
 }
+.tbl thead th { position: sticky; top: 0; z-index: 1; background: #0f1426; }
 .tbl tr.stale { opacity: .45; }
 .ell { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .own { font-weight: 600; }
@@ -1590,11 +1619,17 @@ header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; mi
 .tag { color: var(--muted); font-size: 10px; border: 1px solid var(--line); border-radius: 6px; padding: 0 4px; margin-left: 4px; }
 .empty { padding: 12px; color: var(--muted); font-family: var(--mono); font-size: 13px; }
 .scroll { padding: 12px; }
-.msgs { list-style: none; margin: 0; padding: 0; min-width: 0; }
+.msgs { display: flow-root; list-style: none; margin: 0; padding: 0; min-width: 0; }
 .msg {
   position: relative; display: grid; grid-template-columns: 40px minmax(0, 1fr); column-gap: 12px;
   align-items: start; min-width: 0; padding: 12px 14px 12px 12px; margin: 0 0 10px; border-radius: 13px;
   background: rgba(255, 255, 255, .045); border: 1px solid transparent;
+}
+/* A card taller than the window: shown alone, cut off with a fade at the bottom. */
+.msg.clip { overflow: hidden; }
+.msg.clip::after {
+  content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 44px; border-radius: 0 0 13px 13px;
+  background: linear-gradient(to bottom, rgba(15, 20, 38, 0), rgba(15, 20, 38, 1)); pointer-events: none;
 }
 .avatar { grid-column: 1; grid-row: 1; align-self: start; width: 40px; height: 44px; overflow: visible; }
 .content { grid-column: 2; grid-row: 1; min-width: 0; display: grid; gap: 4px; }
@@ -1657,7 +1692,7 @@ header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; mi
     </header>
     <div class="counts" id="counts"></div>
     <section class="panel claims-panel">
-      <div class="bar"><span class="lights"><i class="r"></i><i class="y"></i><i class="g"></i></span><span class="title">active claims</span></div>
+      <div class="bar"><span class="lights"><i class="r"></i><i class="y"></i><i class="g"></i></span><span class="title">active claims</span><span class="pager" id="claims-pager" hidden></span></div>
       <div class="tblwrap"><table class="tbl" id="claims">
         <colgroup><col class="c-owner"><col class="c-branch"><col class="c-paths"><col class="c-desc"><col class="c-left"><col class="c-copy"></colgroup>
         <thead><tr><th>owner</th><th>branch</th><th>paths</th><th>description</th><th>time left</th><th></th></tr></thead>
@@ -1665,7 +1700,7 @@ header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; mi
       </table></div>
     </section>
     <section class="panel sessions-panel">
-      <div class="bar"><span class="lights"><i class="r"></i><i class="y"></i><i class="g"></i></span><span class="title">sessions, last 24h</span></div>
+      <div class="bar"><span class="lights"><i class="r"></i><i class="y"></i><i class="g"></i></span><span class="title">sessions, last 24h</span><span class="pager" id="sessions-pager" hidden></span></div>
       <div class="tblwrap"><table class="tbl" id="sessions">
         <colgroup><col style="width:24%"><col style="width:18%"><col style="width:36%"><col style="width:22%"></colgroup>
         <thead><tr><th>owner</th><th>branch</th><th>worktree</th><th>last seen</th></tr></thead>
@@ -1674,7 +1709,8 @@ header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; mi
     </section>
   </div>
   <section class="panel msgpanel">
-    <div class="bar"><span class="lights"><i class="r"></i><i class="y"></i><i class="g"></i></span><span class="title" id="store">.agentlog/</span><i class="dot live"></i></div>
+    <div class="bar"><span class="lights"><i class="r"></i><i class="y"></i><i class="g"></i></span><span class="title" id="store">.agentlog/</span><span class="player" id="player"></span><i class="dot live" id="livedot"></i></div>
+    <div class="scrubrow"><input type="range" class="scrub" id="scrub" min="0" max="0" value="0" aria-label="Message position" disabled><span class="scrub-time" id="scrub-time"></span></div>
     <div class="scroll" id="scroll"><ol class="msgs" id="messages"></ol></div>
   </section>
 </div>
@@ -1699,6 +1735,7 @@ const MIDDOT = '\u00b7';
 const COPY_ICON = '\u29c9';
 const CHECK = '\u2713';
 const pageStart = Date.now();
+const SVGNS = 'http://www.w3.org/2000/svg';
 
 const own = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
 const agentColor = (a) => (own(AGENT_COLORS, a) ? AGENT_COLORS[a] : FALLBACK);
@@ -1733,15 +1770,14 @@ function timeLeft(expires) {
   return mins > 0 ? mins + 'm left' : 'expired';
 }
 function avatar(color) {
-  const NS = 'http://www.w3.org/2000/svg';
-  const svg = document.createElementNS(NS, 'svg');
+  const svg = document.createElementNS(SVGNS, 'svg');
   svg.setAttribute('class', 'avatar');
   svg.setAttribute('viewBox', '0 0 40 44');
   svg.setAttribute('width', '40');
   svg.setAttribute('height', '44');
   svg.setAttribute('aria-hidden', 'true');
   svg.style.color = color;
-  const use = document.createElementNS(NS, 'use');
+  const use = document.createElementNS(SVGNS, 'use');
   use.setAttribute('href', '#bot');
   // The symbol's own viewBox does the offset, as in the hero.
   use.setAttribute('x', '0');
@@ -1750,6 +1786,40 @@ function avatar(color) {
   use.setAttribute('height', '44');
   svg.appendChild(use);
   return svg;
+}
+
+// Inline SVG icons for the buttons: a font without the glyphs cannot hide them.
+const ICON = {
+  oldest: [['rect', { x: 4, y: 5, width: 2.5, height: 14 }], ['polygon', { points: '20,5 9,12 20,19' }]],
+  rewind: [['polygon', { points: '12,6 3,12 12,18' }], ['polygon', { points: '21,6 12,12 21,18' }]],
+  back: [['polygon', { points: '15,6 6,12 15,18' }]],
+  play: [['polygon', { points: '7,5 19,12 7,19' }]],
+  pause: [['rect', { x: 6, y: 5, width: 4, height: 14 }], ['rect', { x: 14, y: 5, width: 4, height: 14 }]],
+  forward: [['polygon', { points: '9,6 18,12 9,18' }]],
+  live: [['polygon', { points: '4,5 15,12 4,19' }], ['rect', { x: 17, y: 5, width: 2.5, height: 14 }]],
+  prev: [['polygon', { points: '15,5 7,12 15,19' }]],
+  next: [['polygon', { points: '9,5 17,12 9,19' }]],
+};
+function icon(name) {
+  const svg = document.createElementNS(SVGNS, 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('aria-hidden', 'true');
+  svg.setAttribute('focusable', 'false');
+  for (const [tag, attrs] of ICON[name]) {
+    const node = document.createElementNS(SVGNS, tag);
+    for (const k of Object.keys(attrs)) node.setAttribute(k, String(attrs[k]));
+    svg.appendChild(node);
+  }
+  return svg;
+}
+function iconButton(name, label, onClick) {
+  const b = el('button', 'pbtn', null);
+  b.type = 'button';
+  b.setAttribute('aria-label', label);
+  b.title = label;
+  b.appendChild(icon(name));
+  b.addEventListener('click', onClick);
+  return b;
 }
 
 // Copy an id. The button shows a check for 1.2s. If the clipboard is refused,
@@ -1769,8 +1839,8 @@ function selectForCopy(text) {
   fallbackInput.focus();
   fallbackInput.select();
 }
-// Ids whose copy button shows the check mark, id -> timer. A table re-render
-// rebuilds the buttons, so the state lives here and every button for an id follows it.
+// Ids whose copy button shows the check mark, id -> timer. Re-renders rebuild the
+// buttons, so the state lives here and every button for an id follows it.
 const flashing = new Map();
 function paintCopy(id) {
   const on = flashing.has(id);
@@ -1835,17 +1905,16 @@ function pathsCell(paths) {
   return td;
 }
 
-const list = document.getElementById('messages');
-const scroller = document.getElementById('scroll');
+// ---------------------------------------------------------------- tables
+
 const wideQuery = window.matchMedia('(min-width: 1100px)');
-// Prepending keeps the view still. Wide: the messages panel scrolls. Stacked: the window does.
-function viewOffset() { return wideQuery.matches ? scroller.scrollTop : window.scrollY; }
-function nudgeView(px) { if (wideQuery.matches) scroller.scrollTop += px; else window.scrollBy(0, px); }
-// A card's height with its margins: the space its insertion adds above the view.
-function spacePx(li) { const cs = getComputedStyle(li); return li.offsetHeight + parseFloat(cs.marginTop) + parseFloat(cs.marginBottom); }
-const seenIds = new Set();
 let claims = [];
 let sessions = [];
+const tables = {
+  claims: { page: 0, pager: null, cols: 6, empty: 'no active claims' },
+  sessions: { page: 0, pager: null, cols: 4, empty: 'no sessions' },
+};
+const STACKED_ROWS = 10;
 
 function updateCounts() {
   const agents = new Set(sessions.map((s) => s.agent)).size;
@@ -1853,61 +1922,98 @@ function updateCounts() {
     agents + (agents === 1 ? ' agent' : ' agents') + ' ' + MIDDOT + ' 1 board';
   document.getElementById('counts').textContent =
     claims.length + ' active claims ' + MIDDOT + ' ' + sessions.length + ' sessions (24h) ' + MIDDOT + ' ' +
-    list.children.length + ' messages';
+    buffer.length + ' messages';
 }
 
-function renderClaims() {
-  const body = document.querySelector('#claims tbody');
+// Rows that fit the panel. Wide: the panel body's height over the measured row
+// height. The claims panel is capped at 40% of the column (see the CSS).
+function rowsPerPage(key) {
+  if (!wideQuery.matches) return STACKED_ROWS;
+  const panel = document.querySelector('#' + key).closest('.panel');
+  const left = document.querySelector('.left');
+  const panelH = key === 'claims' ? left.clientHeight * 0.4 : panel.clientHeight;
+  const bodyH = panelH - panel.querySelector('.bar').offsetHeight - panel.querySelector('thead').offsetHeight - 2;
+  const sample = panel.querySelector('tbody tr');
+  const rowH = Math.max(20, sample ? sample.offsetHeight : 28);
+  return Math.max(1, Math.floor(bodyH / rowH));
+}
+
+function claimRow(c) {
+  const row = el('tr', null, null);
+  row.title = c.id || '';
+  const copy = el('td', 'copy-cell', null);
+  copy.appendChild(copyButton(c.id || '', 'Copy claim ID'));
+  row.append(
+    ownerCell(c.agent, c.session, false),
+    ellCell(c.branch),
+    pathsCell(c.paths),
+    ellCell(String(c.body || '').split('\n')[0]),
+    ellCell(timeLeft(c.expires)),
+    copy);
+  return row;
+}
+function sessionRow(s) {
+  const row = el('tr', s.stale ? 'stale' : null, null);
+  row.append(
+    ownerCell(s.agent, s.session, !!s.stale),
+    ellCell(s.branch),
+    ellCell(s.worktree),
+    ellCell(s.seen));
+  return row;
+}
+
+// Renders one page of a table. A page number survives a data change, clamped to the last page.
+function renderTable(key) {
+  const st = tables[key];
+  const rows = key === 'claims' ? claims : sessions;
+  const per = rowsPerPage(key);
+  const pages = Math.max(1, Math.ceil(rows.length / per));
+  st.page = Math.max(0, Math.min(st.page, pages - 1));
+  const body = document.querySelector('#' + key + ' tbody');
   body.replaceChildren();
-  if (!claims.length) body.appendChild(emptyRow(6, 'no active claims'));
-  for (const c of claims) {
-    const row = el('tr', null, null);
-    row.title = c.id || '';
-    const copy = el('td', 'copy-cell', null);
-    copy.appendChild(copyButton(c.id || '', 'Copy claim ID'));
-    row.append(
-      ownerCell(c.agent, c.session, false),
-      ellCell(c.branch),
-      pathsCell(c.paths),
-      ellCell(String(c.body || '').split('\n')[0]),
-      ellCell(timeLeft(c.expires)),
-      copy);
-    body.appendChild(row);
+  if (!rows.length) {
+    body.appendChild(emptyRow(st.cols, st.empty));
+  } else {
+    for (const r of rows.slice(st.page * per, st.page * per + per)) {
+      body.appendChild(key === 'claims' ? claimRow(r) : sessionRow(r));
+    }
   }
+  const pg = st.pager;
+  pg.host.hidden = pages <= 1;
+  pg.prev.disabled = st.page <= 0;
+  pg.next.disabled = st.page >= pages - 1;
+  pg.label.textContent = (st.page + 1) + ' / ' + pages;
   updateCounts();
 }
 
-function renderSessions() {
-  const body = document.querySelector('#sessions tbody');
-  body.replaceChildren();
-  if (!sessions.length) body.appendChild(emptyRow(4, 'no sessions'));
-  for (const s of sessions) {
-    const row = el('tr', s.stale ? 'stale' : null, null);
-    row.append(
-      ownerCell(s.agent, s.session, !!s.stale),
-      ellCell(s.branch),
-      ellCell(s.worktree),
-      ellCell(s.seen));
-    body.appendChild(row);
-  }
-  updateCounts();
+function buildPager(key) {
+  const host = document.getElementById(key + '-pager');
+  const prev = iconButton('prev', 'Previous page', () => { tables[key].page -= 1; renderTable(key); });
+  const next = iconButton('next', 'Next page', () => { tables[key].page += 1; renderTable(key); });
+  const label = el('span', null, '1 / 1');
+  host.append(prev, label, next);
+  tables[key].pager = { host, prev, next, label };
 }
 
 // "+ show all" appears only while the paths are clamped to two lines. The clamp
-// depends on the width, so refreshClamps runs again after a resize.
-function clampToggle(li) {
+// depends on the width, so the window is rendered again after a resize.
+const expanded = new Set();
+function clampToggle(li, id) {
   const pathsEl = li.querySelector('.paths-clamp');
   if (!pathsEl) return;
   const next = pathsEl.nextElementSibling;
   const existing = next && next.classList.contains('show-all') ? next : null;
-  const clamped = pathsEl.classList.contains('open') || pathsEl.scrollHeight > pathsEl.clientHeight;
+  const open = pathsEl.classList.contains('open');
+  const clamped = open || pathsEl.scrollHeight > pathsEl.clientHeight;
   if (clamped && !existing) {
-    const toggle = el('button', 'show-all', '+ show all');
+    const toggle = el('button', 'show-all', open ? 'show less' : '+ show all');
     toggle.type = 'button';
     toggle.addEventListener('click', (e) => {
       e.stopPropagation();
-      const open = pathsEl.classList.toggle('open');
-      toggle.textContent = open ? 'show less' : '+ show all';
+      const nowOpen = pathsEl.classList.toggle('open');
+      if (nowOpen) expanded.add(id); else expanded.delete(id);
+      toggle.textContent = nowOpen ? 'show less' : '+ show all';
+      scheduleRender();
     });
     pathsEl.after(toggle);
   } else if (!clamped && existing) {
@@ -1915,23 +2021,83 @@ function clampToggle(li) {
     pathsEl.classList.remove('open');
   }
 }
-function refreshClamps() {
-  for (const li of list.children) clampToggle(li);
-}
-let resizeTimer = null;
-window.addEventListener('resize', () => {
-  clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(refreshClamps, 150);
-});
 
-function addMessage(m) {
-  if (m.id && seenIds.has(m.id)) return;   // replayed after a reconnect
+// ---------------------------------------------------------------- messages
+
+const scroller = document.getElementById('scroll');
+const list = document.getElementById('messages');
+const WINDOW_STACKED = 15;     // cards per window below 1100px
+const STEP_MS = 700;           // play speed: one message per step
+const buffer = [];             // { m, glow }, oldest first, at most MAX
+const ids = new Set();
+let mode = 'live';             // 'live' | 'paused' | 'playing'
+let pos = 0;                   // buffer index at the top of the window when not live
+let pending = 0;               // arrivals while paused
+let windowCount = 1;           // cards in the last render
+let timer = null;
+let renderQueued = false;
+
+const newest = () => buffer.length - 1;
+const curPos = () => (mode === 'live' ? newest() : pos);
+
+function setMode(next) {
+  if (next !== 'playing' && timer) { clearInterval(timer); timer = null; }
+  mode = next;
+}
+function pauseAt(i) {
+  if (!buffer.length) return;
+  pos = Math.max(0, Math.min(i, newest()));
+  setMode('paused');
+  render();
+}
+// The oldest message at the bottom of a full window, not alone at the top.
+function oldest() {
+  if (!buffer.length) return;
+  pauseAt(newest());
+  // Move the top down by the older cards cut off below until the oldest is the bottom card.
+  for (let k = 0; k < 5; k++) {
+    const last = list.lastElementChild;
+    const b = last && last._entry ? buffer.indexOf(last._entry) : 0;
+    if (b <= 0) break;
+    pos = Math.max(0, pos - b);
+    render();
+  }
+}
+function goLive() {
+  pending = 0;
+  setMode('live');
+  render();
+}
+function step(delta) {
+  if (!buffer.length) return;
+  const target = curPos() + delta;
+  if (target >= newest()) { goLive(); return; }   // stepping onto the newest message goes live
+  if (target < 0) return;
+  pauseAt(target);
+}
+function play() {
+  if (!buffer.length) return;
+  if (mode === 'playing') { pauseAt(pos); return; }
+  if (mode === 'live') pos = Math.max(0, newest() - windowCount);
+  setMode('playing');
+  timer = setInterval(tick, STEP_MS);
+  render();
+}
+function tick() {
+  if (pos >= newest()) { goLive(); return; }   // caught up with the newest: live again
+  pos += 1;
+  buffer[pos].glow = true;
+  render();
+}
+
+function buildCard(entry) {
+  const m = entry.m;
   const agent = m.agent || 'unknown';
   const color = agentColor(agent);
   const kind = m.kind || '?';
   const li = el('li', 'msg', null);
-  // Live means it was written after this page loaded; backlog never glows.
-  if (Date.parse(m.date) >= pageStart - 2000) li.classList.add('live');
+  if (entry.glow) li.classList.add('live');
+  li._entry = entry;
   if (m.id) li.dataset.id = m.id;
   li.style.borderColor = alpha(color, 0.35);
   if (kind === 'request') li.style.borderLeft = '3px solid ' + KIND_COLORS.request;
@@ -1957,11 +2123,12 @@ function addMessage(m) {
   row1.appendChild(kindEl);
   if (m.to && m.to !== '*') row1.appendChild(el('span', null, ARROW + ' ' + m.to));
   content.appendChild(row1);
-  // Row 2: paths, time left, re= (wraps)
+  // Row 2: paths, time left, re=
   const row2Items = [];
   if (m.paths) {
     const pathsEl = el('span', 'paths-clamp', m.paths);
     pathsEl.title = m.paths;
+    if (m.id && expanded.has(m.id)) pathsEl.classList.add('open');
     row2Items.push(pathsEl);
   }
   if (kind === 'claim' && m.expires != null) row2Items.push(el('span', null, CLOCK + ' ' + timeLeft(m.expires)));
@@ -1978,21 +2145,154 @@ function addMessage(m) {
   content.appendChild(row3);
   content.appendChild(el('div', 'text', m.body == null ? '' : m.body));
   li.appendChild(content);
+  return li;
+}
 
-  const scrolled = viewOffset() > 0;
-  list.prepend(li);
-  clampToggle(li);
-  if (scrolled) nudgeView(spacePx(li));
-  if (m.id) seenIds.add(m.id);
-  while (list.children.length > MAX) {
-    const old = list.lastElementChild;
-    if (old.dataset.id) seenIds.delete(old.dataset.id);
-    old.remove();
+// The window: cards from the top position downward (older), as many as fit.
+// Wide: no card is cut off; a card taller than the window is shown alone, clipped.
+// Stacked: a fixed number of cards.
+function render() {
+  renderQueued = false;
+  const last = newest();
+  const top = curPos();
+  const wide = wideQuery.matches;
+  const limit = wide ? scroller.clientHeight - 24 : Infinity;   // .scroll has 12px padding
+  list.replaceChildren();
+  let shown = 0;
+  for (let i = top; i >= 0 && last >= 0; i--) {
+    if (!wide && shown >= WINDOW_STACKED) break;
+    const li = buildCard(buffer[i]);
+    list.appendChild(li);
+    clampToggle(li, buffer[i].m.id);
+    shown += 1;
+    if (wide && list.offsetHeight > limit) {
+      if (shown === 1) {
+        li.classList.add('clip');
+        li.style.maxHeight = Math.max(80, limit) + 'px';
+      } else {
+        li.remove();
+        shown -= 1;
+      }
+      break;
+    }
   }
+  // A glow plays once: its class is kept only by the render that creates the card.
+  for (const li of list.children) if (li._entry) li._entry.glow = false;
+  windowCount = Math.max(1, shown);
+  renderPlayer(last, top);
   updateCounts();
 }
 
+// Scrubber, time, mode pill, live dot, buttons.
+function renderPlayer(last, top) {
+  const scrub = document.getElementById('scrub');
+  scrub.disabled = last < 0;
+  scrub.max = String(Math.max(0, last));
+  scrub.value = String(Math.max(0, top));
+  const at = last >= 0 && buffer[top] ? String(buffer[top].m.date || '') : '';
+  document.getElementById('scrub-time').textContent = at.replace('T', ' ').replace('Z', '');
+  const labels = { live: 'LIVE', paused: 'PAUSED', playing: 'PLAYING' };
+  modePill.textContent = labels[mode];
+  modePill.className = 'modepill' + (mode === 'live' ? '' : ' ' + mode);
+  livedot.className = 'dot ' + (mode === 'paused' ? 'paused' : 'live');
+  pendPill.textContent = pending > 0 ? '+' + pending : '';
+  pendPill.hidden = pending === 0;
+  playBtn.replaceChildren(icon(mode === 'playing' ? 'pause' : 'play'));
+  playBtn.setAttribute('aria-label', mode === 'playing' ? 'Pause' : 'Play');
+  playBtn.title = mode === 'playing' ? 'Pause' : 'Play';
+  for (const b of player.querySelectorAll('.pbtn')) b.disabled = last < 0;
+}
+
+function scheduleRender() {
+  if (renderQueued) return;
+  renderQueued = true;
+  requestAnimationFrame(render);
+}
+
+function addMessage(m) {
+  if (m.id && ids.has(m.id)) return;   // replayed after a reconnect
+  // Live means written after this page loaded; backlog never glows.
+  const fresh = Date.parse(m.date) >= pageStart - 2000;
+  buffer.push({ m, glow: fresh && mode === 'live' });
+  if (m.id) ids.add(m.id);
+  while (buffer.length > MAX) {
+    const old = buffer.shift();
+    if (old.m.id) ids.delete(old.m.id);
+    pos = Math.max(0, pos - 1);     // the window's top moves with the buffer; clamped to the oldest
+  }
+  if (mode === 'live') pos = newest();
+  if (mode === 'paused') pending += 1;
+  if (mode === 'live') scheduleRender(); else render();   // a few arrivals while paused redraw at once; a live flood batches
+}
+
+// Player: the buttons, mode pill and pending pill are built once.
+const player = document.getElementById('player');
+const livedot = document.getElementById('livedot');
+const modePill = el('span', 'modepill', 'LIVE');
+let playBtn = null;
+let pendPill = null;
+{
+  const liveWrap = el('span', 'livewrap', null);
+  const liveBtn = iconButton('live', 'Back to live', () => goLive());
+  pendPill = el('span', 'pendpill', null);
+  pendPill.hidden = true;
+  liveWrap.append(liveBtn, pendPill);
+  playBtn = iconButton('play', 'Play', () => play());
+  player.append(
+    iconButton('oldest', 'Oldest message', () => oldest()),
+    iconButton('rewind', 'Rewind one window', () => pauseAt(curPos() - windowCount)),
+    iconButton('back', 'Previous message', () => step(-1)),
+    playBtn,
+    iconButton('forward', 'Next message', () => step(1)),
+    liveWrap,
+    modePill);
+}
+document.getElementById('scrub').addEventListener('input', (e) => pauseAt(Number(e.target.value)));
+
+// Keys (when focus is not in a control): arrows step, Space plays or pauses, Home and End.
+document.addEventListener('keydown', (e) => {
+  const t = e.target;
+  if (t && (t.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(t.tagName))) return;
+  if (e.altKey || e.ctrlKey || e.metaKey) return;
+  if (e.key === 'ArrowLeft') { e.preventDefault(); step(-1); }
+  else if (e.key === 'ArrowRight') { e.preventDefault(); step(1); }
+  else if (e.key === ' ') { e.preventDefault(); if (t && t.tagName === 'BUTTON') t.blur(); play(); }
+  else if (e.key === 'Home') { e.preventDefault(); oldest(); }
+  else if (e.key === 'End') { e.preventDefault(); goLive(); }
+});
+
+// The wheel over the messages moves one message per notch and pauses. Trackpads
+// accumulate small deltas, so a step is taken every 100px.
+let wheelAcc = 0;
+document.querySelector('.msgpanel').addEventListener('wheel', (e) => {
+  if (!e.deltaY) return;
+  e.preventDefault();
+  wheelAcc += e.deltaMode === 1 ? e.deltaY * 33 : e.deltaY;
+  while (Math.abs(wheelAcc) >= 100) {
+    const down = wheelAcc > 0;
+    wheelAcc -= down ? 100 : -100;
+    step(down ? -1 : 1);
+  }
+}, { passive: false });
+
+// ---------------------------------------------------------------- startup and events
+
 const dot = document.getElementById('dot');
+let resizeTimer = null;
+window.addEventListener('resize', () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => {
+    renderTable('claims');
+    renderTable('sessions');
+    scheduleRender();
+  }, 150);
+});
+buildPager('claims');
+buildPager('sessions');
+renderTable('claims');
+renderTable('sessions');
+scheduleRender();
+
 const es = new EventSource('/events?n=' + MAX);
 es.onopen = () => { dot.className = 'dot on'; };
 es.onerror = () => { dot.className = 'dot off'; };
@@ -2005,11 +2305,10 @@ es.addEventListener('claims', (e) => {
   const next = parse(e.data) || [];
   if (JSON.stringify(next) === JSON.stringify(claims)) return;   // unchanged: keep the rows and their state
   claims = next;
-  renderClaims();
+  renderTable('claims');
 });
-es.addEventListener('sessions', (e) => { sessions = parse(e.data) || []; renderSessions(); });
-setInterval(renderClaims, 30000);
-updateCounts();
+es.addEventListener('sessions', (e) => { sessions = parse(e.data) || []; renderTable('sessions'); });
+setInterval(() => renderTable('claims'), 30000);
 JS
 
 while (1) {
