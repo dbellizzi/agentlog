@@ -1,12 +1,12 @@
 #!/bin/sh
-# shellcheck disable=SC2034,SC1010,SC2015  # vars are used inside eval strings
+# shellcheck disable=SC2016,SC2034,SC1010,SC2015  # vars are used inside eval strings; check strings expand when eval runs
 # Self-contained tests: each case runs against a fresh store in a temp dir.
 set -eu
 
 here=$(cd "$(dirname "$0")/.." && pwd)
 AL=${AGENTLOG_TEST_BIN:-$here/bin/agentlog} # override to test another shell
 root=$(mktemp -d "${TMPDIR:-/tmp}/agentlog-test.XXXXXX")
-trap 'chmod -R u+w "$root" 2>/dev/null; rm -rf "$root"' EXIT
+trap '[ -z "${DPID:-}" ] || kill "$DPID" 2>/dev/null; chmod -R u+w "$root" 2>/dev/null; rm -rf "$root"' EXIT
 # Never touch the real home: hooks auto-install into ~/.local/bin and ~/.codex.
 export HOME="$root/home"
 mkdir -p "$HOME/.codex"
@@ -382,7 +382,7 @@ fresh install
 dest=$HOME/.local/bin/agentlog rules=$HOME/.codex/rules/agentlog.rules
 check "install: hook auto-installed on SessionStart" "[ -x \"$dest\" ] && cmp -s \"$AL\" \"$dest\" && [ -f \"$rules\" ]"
 check "install: rule allows only the absolute installed path" "grep -q 'pattern = \\[\"$dest\", \\[\"write\"' \"$rules\""
-check "install: rule never allows install/gc/hook/tail" "! grep -E '\"(install|gc|hook|tail)\"' \"$rules\""
+check "install: rule never allows install/gc/hook/tail/dashboard" "! grep -E '\"(install|gc|hook|tail|dashboard)\"' \"$rules\""
 check "install: idempotent" "\"$AL\" install | grep -c 'up to date' | grep -qx 2"
 if command -v codex >/dev/null 2>&1; then
   check "install: codex accepts the rule (write allowed)" "codex execpolicy check --rules \"$rules\" \"$dest\" write hi 2>/dev/null | grep -q '\"decision\":\"allow\"'"
@@ -402,7 +402,7 @@ ags=$HOME/.gemini/antigravity-cli/settings.json
 mkdir -p "$(dirname "$ags")"
 printf '{"model":"m","permissions":{"allow":["command(git diff)"]}}\n' >"$ags"
 "$AL" install >/dev/null
-check "install: antigravity grants cover board subcommands only" "[ \"\$(jq --arg d \"command($dest \" '[.permissions.allow[] | select(startswith(\$d))] | length' \"$ags\")\" -eq 9 ] && ! jq -r '.permissions.allow[]' \"$ags\" | grep -qE ' (install|gc|hook|tail)\)$'"
+check "install: antigravity grants cover board subcommands only" "[ \"\$(jq --arg d \"command($dest \" '[.permissions.allow[] | select(startswith(\$d))] | length' \"$ags\")\" -eq 9 ] && ! jq -r '.permissions.allow[]' \"$ags\" | grep -qE ' (install|gc|hook|tail|dashboard)\)$'"
 check "install: antigravity settings otherwise untouched" "jq -e '.model == \"m\" and .permissions.allow[0] == \"command(git diff)\"' \"$ags\" >/dev/null"
 check "install: antigravity grants idempotent" "\"$AL\" install | grep -q \"up to date: $ags\" && [ \"\$(jq '.permissions.allow | length' \"$ags\")\" -eq 10 ]"
 "$AL" install --no-antigravity-rule >/dev/null
@@ -441,6 +441,135 @@ for f in tmp/keep msgs/notes.txt sessions/config; do echo data >"$victim/$f"; do
 touch -t 202001010000 "$victim"/tmp/keep "$victim"/msgs/notes.txt "$victim"/sessions/config
 AGENTLOG_DIR=$victim run a aaaa1111 gc --days 1
 check "harden: gc only deletes agentlog's own files" "[ -f \"$victim/tmp/keep\" ] && [ -f \"$victim/msgs/notes.txt\" ] && [ -f \"$victim/sessions/config\" ]"
+
+# --- dashboard: a perl server fed by the store; read-only toward the board
+fresh dash
+dt=$root/dash-t
+mkdir -p "$dt"
+DPID='' DBASE='' DPORT=''
+http_code() { curl -s -o /dev/null -w '%{http_code}' "$@" 2>/dev/null || :; }
+dash_get() { # dash_get FILE PATH [HEADER]: read the stream for a second into FILE
+  if [ -n "${3:-}" ]; then curl -sN --max-time 1 -H "$3" "$DBASE$2" >"$1" 2>/dev/null || :
+  else curl -sN --max-time 1 "$DBASE$2" >"$1" 2>/dev/null || :; fi
+}
+dash_claims() { # the claims event of a fresh snapshot
+  dash_get "$dt/snap" "/events?n=1"
+  awk '/^event: claims$/ { getline; print; exit }' "$dt/snap"
+}
+dash_csp_ok() {
+  curl -s -D "$dt/h" -o /dev/null "$DBASE/" &&
+    grep -qiF "content-security-policy: default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'" "$dt/h"
+}
+ids_of() { grep '^id: ' "$1" | sed 's/^id: //'; }
+# The perl child of dashboard $1 (a shell pid): 0 when its arguments end at the
+# log limit, so no opener path was passed (stdout here is not a terminal).
+dash_perl_gets_no_opener() {
+  for _dpc in $(pgrep -P "$1"); do
+    ps -p "$_dpc" -o args= | grep -q '^perl -e' || continue
+    ps -p "$_dpc" -o args= | grep -q ' 1000 *$' && return 0
+  done
+  return 1
+}
+
+m1=$(run codex bbbb2222 write "dash first")
+ml=$(run codex bbbb2222 write 'dash line one
+dash line two')
+m2=$(run codex bbbb2222 write "dash second")
+c=$(run codex bbbb2222 write -k claim -p 'dash/**' "dash claim" 2>/dev/null)
+m3=$(run claude-code aaaa1111 write "dash third")
+exp3=$(printf '%s\n%s' "$c" "$m3")
+exp4=$(printf '%s\n%s\n%s\n%s' "$ml" "$m2" "$c" "$m3")
+# Temp files that atomic_write leaves in sessions/ are not records. One is a
+# valid record under a fake session id (must be ignored); one is unreadable (its
+# presence must not make any reader print an error).
+printf 'agent=codex\nsession=ffff0000-hidden\nbranch=x\nworktree=/x\nhost=h\nseen=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$AGENTLOG_DIR/sessions/.w.test.hidden"
+printf 'agent=codex\nsession=ffff0001-locked\n' >"$AGENTLOG_DIR/sessions/.w.test.locked"
+chmod 000 "$AGENTLOG_DIR/sessions/.w.test.locked"
+# The dashboard runs as codex bbbb2222; its presence and cursor must not move.
+run codex bbbb2222 read --peek >/dev/null
+touch -t 202001010000 "$AGENTLOG_DIR/seen/bbbb2222" "$AGENTLOG_DIR/sessions/bbbb2222"
+touch -t 202001020000 "$dt/ref"
+ro_before=$(cat "$AGENTLOG_DIR/seen/bbbb2222" "$AGENTLOG_DIR/sessions/bbbb2222" | cksum)
+
+PERL5OPT=-MNoSuchModule PERL5LIB=$root/nope AGENTLOG_AGENT=codex AGENTLOG_SESSION=bbbb2222 \
+  "$AL" dashboard --port 0 >"$dt/log" 2>"$dt/err" &
+DPID=$!
+i=0; while [ $i -lt 50 ] && ! grep -q 'dashboard at' "$dt/log"; do sleep 0.1; i=$((i + 1)); done
+DBASE=$(sed -n 's|^agentlog: dashboard at \(http://127\.0\.0\.1:[0-9]*\)/ .*|\1|p' "$dt/log")
+DPORT=${DBASE##*:}
+check "dashboard: starts and prints its URL despite PERL5OPT and PERL5LIB" '[ -n "$DBASE" ]'
+check "dashboard: outside a terminal perl gets no opener to run" 'dash_perl_gets_no_opener "$DPID"'
+run codex bbbb2222 who >/dev/null 2>"$dt/who.err"
+check "who: skips hidden temp session files, and prints no errors for them" '! run codex bbbb2222 who 2>/dev/null | grep -q ffff0000 && [ ! -s "$dt/who.err" ]'
+dash_get "$dt/hid" "/events?n=1"
+check "dashboard: its sessions event skips hidden temp session files" 'grep -q "^event: sessions" "$dt/hid" && ! grep -q ffff0000 "$dt/hid"'
+check "dashboard: no store-race noise on stderr after several polls" '[ ! -s "$dt/err" ]'
+i=0; while [ $i -lt 60 ] && ! { dash_claims | grep -qF "$c" && grep -qF "$m3" "$dt/snap"; }; do sleep 0.2; i=$((i + 1)); done
+
+check "dashboard: GET / is the page, with the CSP header" 'dash_csp_ok && [ "$(http_code "$DBASE/")" = 200 ]'
+check "dashboard: GET /app.js is served" '[ "$(http_code "$DBASE/app.js")" = 200 ]'
+check "dashboard: a foreign Host header is refused" '[ "$(http_code -H "Host: evil.example:$DPORT" "$DBASE/")" = 403 ]'
+check "dashboard: non-GET methods get 405" '[ "$(http_code -X POST "$DBASE/events")" = 405 ]'
+dash_get "$dt/n2" "/events?n=2"
+check "dashboard: claims and sessions snapshots, then the 2 newest messages oldest first" 'grep -qx "event: claims" "$dt/n2" && grep -qx "event: sessions" "$dt/n2" && [ "$(ids_of "$dt/n2")" = "$exp3" ]'
+dash_get "$dt/resume" "/events" "Last-Event-ID: $m1"
+check "dashboard: Last-Event-ID replays only the messages after it" '[ "$(ids_of "$dt/resume")" = "$exp4" ]'
+dash_get "$dt/all" "/events"
+check "dashboard: a multi-line body is one data line with \\n escapes" '[ "$(grep -c "^data: .*dash line one" "$dt/all")" -eq 1 ] && grep -qF "dash line one\ndash line two" "$dt/all" && ! grep -q "^dash line two" "$dt/all"'
+check "dashboard: an open claim is in the claims event" 'dash_claims | grep -qF "$c"'
+run claude-code aaaa1111 write -k done -r "$c" "dash done" >/dev/null
+i=0; while [ $i -lt 30 ] && dash_claims | grep -qF "$c"; do sleep 0.3; i=$((i + 1)); done
+check "dashboard: a closed claim leaves the claims event" '_cl=$(dash_claims); [ -n "$_cl" ] && ! printf "%s" "$_cl" | grep -qF "$c"'
+curl -sN --max-time 8 "$DBASE/events?n=1" >"$dt/live" 2>/dev/null &
+LP=$!
+run claude-code aaaa1111 write "dash live arrival" >/dev/null
+i=0; while [ $i -lt 60 ] && ! grep -qF "dash live arrival" "$dt/live"; do sleep 0.1; i=$((i + 1)); done
+check "dashboard: a new message reaches an open stream within 6s" 'grep -qF "dash live arrival" "$dt/live"'
+kill "$LP" 2>/dev/null || :
+wait "$LP" 2>/dev/null || :
+check "dashboard: running it leaves seen/ and sessions/ of its identity unchanged" '[ -z "$(find "$AGENTLOG_DIR/seen/bbbb2222" "$AGENTLOG_DIR/sessions/bbbb2222" -newer "$dt/ref")" ] && [ "$(cat "$AGENTLOG_DIR/seen/bbbb2222" "$AGENTLOG_DIR/sessions/bbbb2222" | cksum)" = "$ro_before" ]'
+check "dashboard: bad --port or -n, and a port in use, exit non-zero" '! run codex bbbb2222 dashboard --port abc 2>/dev/null && ! run codex bbbb2222 dashboard --port 65536 2>/dev/null && ! run codex bbbb2222 dashboard -n x 2>/dev/null && ! run codex bbbb2222 dashboard -n 0 2>/dev/null && ! run codex bbbb2222 dashboard --port "$DPORT" >"$dt/inuse" 2>&1 && grep -q "cannot listen" "$dt/inuse"'
+check "dashboard: --no-open is accepted; --no-open=x and unknown flags are refused" '! run codex bbbb2222 dashboard --no-open=x 2>/dev/null && ! run codex bbbb2222 dashboard --bogus 2>/dev/null && run codex bbbb2222 dashboard --no-open --port abc 2>&1 | grep -q "needs an integer"'
+mkdir -p "$root/inuse-tmp"
+TMPDIR=$root/inuse-tmp AGENTLOG_AGENT=codex AGENTLOG_SESSION=bbbb2222 "$AL" dashboard --port "$DPORT" >/dev/null 2>&1 || :
+check "dashboard: a bind failure leaves no temp dir or FIFO behind" '[ -z "$(find "$root/inuse-tmp" -mindepth 1)" ]'
+kill "$DPID" 2>/dev/null || :
+wait "$DPID" 2>/dev/null || :
+DPID=''
+
+# TERM to the dashboard's shell frees its port at once: the traps kill the server.
+# Without that the server lingers until the feed's next poll (up to 2s), so probe
+# three fresh dashboards 0.2s after TERM and count any that still answer.
+mkdir -p "$root/term-tmp"
+tleak=0
+for k in 1 2 3; do
+  TMPDIR=$root/term-tmp AGENTLOG_AGENT=codex AGENTLOG_SESSION=bbbb2222 "$AL" dashboard --port 0 >"$dt/tlog$k" 2>&1 &
+  TPID=$!
+  i=0; while [ $i -lt 50 ] && ! grep -q 'dashboard at' "$dt/tlog$k"; do sleep 0.1; i=$((i + 1)); done
+  TBASE=$(sed -n 's|^agentlog: dashboard at \(http://127\.0\.0\.1:[0-9]*\)/ .*|\1|p' "$dt/tlog$k")
+  sleep 2.5   # let the feed reach its poll sleep: the old traps release only at its next poll
+  if [ $k -eq 1 ]; then
+    check "dashboard: the FIFO exists while the dashboard runs" '[ -n "$(find "$root/term-tmp" -name feed.fifo)" ]'
+  fi
+  kill -TERM "$TPID" 2>/dev/null || :
+  sleep 0.2
+  [ "$(http_code "$TBASE/")" = 000 ] || tleak=$((tleak + 1))
+  wait "$TPID" 2>/dev/null || :
+done
+check "dashboard: TERM frees the port at once (none of 3 answers 0.2s later)" '[ -n "$TBASE" ] && [ "$tleak" -eq 0 ]'
+check "dashboard: TERM leaves no FIFO behind" '[ -z "$(find "$root/term-tmp" -name feed.fifo)" ]'
+mkdir -p "$root/two-tmp"
+TMPDIR=$root/two-tmp AGENTLOG_AGENT=codex AGENTLOG_SESSION=bbbb2222 "$AL" dashboard --port 0 >"$dt/two1" 2>&1 &
+T1=$!
+TMPDIR=$root/two-tmp AGENTLOG_AGENT=codex AGENTLOG_SESSION=bbbb2222 "$AL" dashboard --port 0 >"$dt/two2" 2>&1 &
+T2=$!
+i=0; while [ $i -lt 50 ] && ! { grep -q 'dashboard at' "$dt/two1" && grep -q 'dashboard at' "$dt/two2"; }; do sleep 0.1; i=$((i + 1)); done
+check "dashboard: two started at once each get their own FIFO" '[ "$(find "$root/two-tmp" -name feed.fifo | wc -l | tr -d " ")" -eq 2 ] && grep -q "dashboard at" "$dt/two1" && grep -q "dashboard at" "$dt/two2"'
+kill -TERM "$T1" "$T2" 2>/dev/null || :
+wait "$T1" "$T2" 2>/dev/null || :
+check "dashboard: TERM to both leaves no FIFO behind" '[ -z "$(find "$root/two-tmp" -name feed.fifo)" ]'
+
+DPID=''
 
 # --- plugin: manifests point at real files; every hook runs this script for its agent
 pl=$here

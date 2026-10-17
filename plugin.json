@@ -1,6 +1,6 @@
 {
   "name": "agentlog",
   "displayName": "agentlog",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "description": "Shared, append-only message board so AI agents working in the same repo can coordinate."
 }
