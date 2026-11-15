@@ -301,6 +301,108 @@ check "sync: sync_repos globs match the repo key" "on m1 run x xxxx0000 install 
 git -C "$root/m2/repo" remote remove origin
 check "sync: a repo without origin says why it can't sync" "on m2 run codex bbbb2222 sync 2>&1 | grep -q 'no usable origin'"
 
+# --- profiles: migrate two machines, isolate boards and fail closed
+fresh profiles
+for m in p1 p2; do
+  mkdir -p "$root/$m/home/.config/agentlog"
+  printf 'remote=%s\nsync_repos=github.com/owner/*\n' "$root/profile-remote" >"$root/$m/home/.config/agentlog/config"
+  git init -q "$root/$m/repo"
+  git -C "$root/$m/repo" remote add origin git@github.com:owner/repo.git
+done
+check "profiles: simple mode exposes implicit default" "on p1 run x pp111111 sync status | grep -qx 'profile: default'"
+legacy=$(on p1 run x pp111111 write 'legacy personal history')
+on p1 run x pp111111 sync --quiet
+on p2 run y pp222222 sync --quiet
+on p2 run y pp222222 read >/dev/null
+on p1 run x pp111111 profile migrate local >/dev/null
+on p2 run y pp222222 profile migrate local >/dev/null
+ps=$root/p1/store/profiles/local/github.com/owner/repo
+check "profiles: migration selects named store and preserves destination" "on p1 run x pp111111 sync status | grep -qx 'destination: $root/profile-remote/github.com/owner/repo' && [ -f '$ps/msgs/$legacy.msg' ]"
+check "profiles: migration retains original board" "[ -f '$root/p1/store/msgs/$legacy.msg' ]"
+check "profiles: migration preserves read cursor" "[ -z \"\$(on p2 run y pp222222 read)\" ]"
+check "profiles: migrated history imports exactly once" "[ -f '$ps/.legacy-imported' ]"
+check "profiles: repeated migration rejected" "! on p1 run x pp111111 profile migrate another 2>/dev/null"
+on p1 run x pp111111 write 'after named migration' >/dev/null
+on p1 run x pp111111 sync --quiet
+on p2 run y pp222222 sync --quiet
+check "profiles: sync still crosses machines after migration" "on p2 run y pp222222 read | grep -q 'after named migration'"
+check "profiles: env cannot redirect named profile" "! on p1 env AGENTLOG_REMOTE='$root/wrong-remote' \"$AL\" sync 2>/dev/null && [ ! -e '$root/wrong-remote' ]"
+check "profiles: legacy install flags cannot bypass policy" "! on p1 \"$AL\" install --remote '$root/wrong-remote' 2>/dev/null && ! on p1 \"$AL\" install --no-remote 2>/dev/null && ! on p1 \"$AL\" install --sync-repos '*' 2>/dev/null"
+check "profiles: names and transports validated" "! on p1 \"$AL\" profile add '../bad' --local 2>/dev/null && ! on p1 \"$AL\" profile add bad --remote 'ssh://h;cmd/path' 2>/dev/null"
+on p1 "$AL" profile add company --remote "$root/profile-remote" >/dev/null
+check "profiles: destinations immutable through CLI" "! on p1 \"$AL\" profile add local --remote '$root/wrong-remote' 2>/dev/null"
+check "profiles: unknown route target rejected" "! on p1 \"$AL\" route add 'github.com/company/*' --profile missing 2>/dev/null"
+on p1 "$AL" route add 'github.com/company/*' --profile company >/dev/null
+check "profiles: duplicate route rejected" "! on p1 \"$AL\" route add 'github.com/company/*' --profile local 2>/dev/null"
+git -C "$root/p1/repo" remote set-url origin git@github.com:company/repo.git
+check "profiles: changing organization hides previous board" "[ -z \"\$(on p1 run reader pp333333 read --all --peek)\" ]"
+on p1 run x pp111111 write 'company history' >/dev/null
+on p1 run x pp111111 sync --quiet
+check "profiles: new profiles namespace remote storage" "grep -q 'company history' '$root/profile-remote/profiles/company/github.com/company/repo/msgs/'*.msg && [ ! -d '$root/profile-remote/github.com/company' ]"
+check "profiles: personal remote has no company message" "! grep -q 'company history' '$root/profile-remote/github.com/owner/repo/msgs/'*.msg"
+git -C "$root/p1/repo" remote set-url origin git@github.com:unmatched/repo.git
+check "profiles: unmatched repos local only without default fallback" "on p1 \"$AL\" sync status | grep -q 'no matching route' && ! on p1 \"$AL\" sync 2>/dev/null"
+on p1 run x pp111111 write 'unmatched history' >/dev/null
+on p1 "$AL" route add 'github.com/unmatched/*' --profile company >/dev/null
+check "profiles: adding route does not export unmatched history" "[ -z \"\$(on p1 run reader pp333333 read --all --peek)\" ]"
+git -C "$root/p1/repo" remote set-url origin git@github.com:owner/repo.git
+on p1 "$AL" route add 'github.com/owner/repo' --profile company >/dev/null
+check "profiles: overlapping routes fail closed" "! on p1 \"$AL\" write 'must not write' 2>/dev/null && ! on p1 \"$AL\" sync 2>/dev/null"
+on p1 "$AL" route remove 'github.com/owner/repo' >/dev/null
+on p1 "$AL" route remove 'github.com/owner/*' >/dev/null
+on p1 "$AL" route add 'github.com/owner/*' --profile company >/dev/null
+check "profiles: reassigning same repo selects fresh board" "[ -z \"\$(on p1 run reader pp333333 read --all --peek)\" ]"
+on p1 run x pp111111 write 'company same repository' >/dev/null
+on p1 run x pp111111 sync --quiet
+check "profiles: old history not relayed to new profile" "! grep -q 'legacy personal history' '$root/profile-remote/profiles/company/github.com/owner/repo/msgs/'*.msg"
+on p1 "$AL" profile add offline --local >/dev/null
+on p1 "$AL" route add 'github.com/offline/*' --profile offline >/dev/null
+git -C "$root/p1/repo" remote set-url origin git@github.com:offline/repo.git
+check "profiles: local-only profile is writable without network" "on p1 \"$AL\" write 'offline message' >/dev/null && on p1 \"$AL\" sync status | grep -q 'local only' && ! on p1 \"$AL\" sync 2>/dev/null"
+check "profiles: three profiles listed" "[ \"\$(on p1 \"$AL\" profile list | wc -l | tr -d ' ')\" -eq 3 ]"
+git -C "$root/p1/repo" remote set-url origin git@github.com:owner/repo.git
+sed "s|^profile_company_remote=.*|profile_company_remote=$root/wrong-remote|" "$root/p1/home/.config/agentlog/config" >"$root/changed-policy"
+cp "$root/changed-policy" "$root/p1/home/.config/agentlog/config"
+check "profiles: manual destination edit refuses existing board" "! on p1 \"$AL\" sync 2>/dev/null && [ ! -e '$root/wrong-remote' ]"
+# Re-enable the migrated profile under a different repo key: never re-import
+# the old unnamespaced board merely because the same route still matches.
+on p1 "$AL" route remove 'github.com/owner/*' >/dev/null
+on p1 "$AL" route add 'github.com/owner/*' --profile local >/dev/null
+git -C "$root/p1/repo" remote set-url origin git@github.com:owner/renamed.git
+check "profiles: changed origin cannot re-import old board" "[ -z \"\$(on p1 run reader pp333333 read --all --peek)\" ]"
+git -C "$root/p1/repo" remote set-url origin 'git@github.com:owner/re?po.git'
+check "profiles: malformed origin does not alias another board" "on p1 \"$AL\" sync status | grep -qx 'repository: _no-origin' && ! on p1 \"$AL\" sync 2>/dev/null"
+
+# --- profile worktrees: the fallback and migration stay in the selected realm
+fresh profilewt
+unset AGENTLOG_DIR
+mkdir -p "$root/pwt/home" "$root/pwt/repo"
+pr=$(cd "$root/pwt/repo" && pwd -P)
+pw=$root/pwt/side
+git -C "$pr" init -q -b main
+git -C "$pr" -c user.name=test -c user.email=t@t -c commit.gpgsign=false commit -q --allow-empty -m init
+git -C "$pr" remote add origin git@github.com:work/repo.git
+git -C "$pr" worktree add -q -b side "$pw"
+pw=$(cd "$pw" && pwd -P)
+pwt() { _where=$1; shift; (cd "$_where" && HOME=$root/pwt/home AGENTLOG_NO_INSTALL=1 "$@"); }
+pwt "$pr" "$AL" profile add work --local >/dev/null
+pwt "$pr" "$AL" route add 'github.com/work/*' --profile work >/dev/null
+pwt "$pr" run x ww111111 write 'shared profile message' >/dev/null
+pstore=$pr/.agentlog/profiles/work/github.com/work/repo
+pfallback=$pw/.agentlog/profiles/work/github.com/work/repo
+check "profiles: linked worktree selects shared named store" "[ \"\$(pwt '$pw' \"$AL\" dir | head -1)\" = '$pstore' ]"
+chmod -R a-w "$pr/.agentlog"
+fallback_id=$(pwt "$pw" run y ww222222 write 'profile sandbox fallback')
+check "profiles: sandbox fallback uses profile and repository namespace" "[ -f '$pfallback/msgs/$fallback_id.msg' ]"
+check "profiles: main reader sees same-profile fallback" "pwt '$pr' run z ww333333 read --peek | grep -q 'profile sandbox fallback'"
+chmod -R u+w "$pr/.agentlog"
+pwt "$pr" run z ww333333 read >/dev/null
+check "profiles: fallback migrates only into named shared board" "[ -f '$pstore/msgs/$fallback_id.msg' ] && [ ! -f '$pfallback/msgs/$fallback_id.msg' ] && [ ! -d '$pr/.agentlog/msgs' ]"
+pwt "$pr" "$AL" profile add other --local >/dev/null
+pwt "$pr" "$AL" route remove 'github.com/work/*' >/dev/null
+pwt "$pr" "$AL" route add 'github.com/work/*' --profile other >/dev/null
+check "profiles: changing worktree profile cannot union old profile stores" "[ -z \"\$(pwt '$pw' run z ww333333 read --all --peek)\" ]"
+
 # --- identity from agent env vars
 fresh ident
 check "identity: Claude Code env" "[ \"\$(CLAUDE_CODE_SESSION_ID=abc123456789 \"$AL\" whoami)\" = 'claude-code:abc12345 (session abc123456789)' ]"

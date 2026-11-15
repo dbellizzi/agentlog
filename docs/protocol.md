@@ -111,6 +111,69 @@ agentlog install --remote ssh://me@server/home/me/agentlog --sync-repos 'github.
 - **Expiry:** once a day a sync deletes files older than `gc_days` (default 7) on the remote, as `gc` does locally.
 - **Hosts:** messages carry `Host:` and presence carries `host=` (from `hostname -s`, or `host=` in the config). Output names the machine whenever it isn't this one: `codex:01a11e5b on studio`.
 
+## Sync profiles and policy
+
+Without `profiles=yes`, the legacy `remote`/`sync_repos` configuration is the
+implicit `default` profile, with the original store and remote layouts. Profiles
+are opt-in: adding a definition alone does not change routing.
+
+The trusted policy is `~/.config/agentlog/config`, parsed as data, never sourced.
+Profile management publishes changes with an atomic rename under a configuration
+lock. Repository files cannot supply destinations or executable transports.
+An example policy is:
+
+```text
+profile_local_transport=ssh
+profile_local_remote=ssh://me@home/path
+profile_local_layout=legacy
+legacy_profile=local
+legacy_repos=github.com/me/*
+profile_company_transport=directory
+profile_company_remote=/mnt/company-agentlog
+profile_company_layout=namespaced
+route=local github.com/me/*
+route=company github.com/company/*
+profiles=yes
+```
+
+`profile migrate NAME` creates the first profile from existing settings, records
+the explicit legacy import scope, creates routes from `sync_repos` (or `*`), and
+enables profile mode in one policy update. It removes the legacy remote settings
+so an old script on this machine cannot continue syncing an unscoped board.
+Each still-matching repository imports its old local messages, presence, read
+cursors and claim nudges once, preserving originals and marking the import.
+A `.profile-owner` marker binds each old store to the migrated profile and repo
+key so a changed origin cannot re-import it into another board. Migration assumes
+the existing board belongs to its currently configured repository; it does not
+infer historical provenance. Upgrade old scripts before continuing local work.
+
+`profile add NAME --remote URL` infers `ssh` or `directory`; `--local` uses
+transport `none`. New profiles use layout `namespaced`. The migrated profile uses
+layout `legacy` so existing peers and remote history remain accessible. Profile
+names contain at most 64 ASCII letters, digits, `_` and `-`, beginning with a
+letter or digit. Route globs support `*` and `?` over the canonical repository key.
+
+Every process takes one policy snapshot. A repository with an origin must match
+exactly one route to select a profile. Multiple matches are an error, even when
+they name the same profile; no match or no usable origin selects the reserved
+local-only `_local` board. There is no fallback to a global remote. Unusable
+origin strings are rejected rather than stripped into another repo's key.
+`AGENTLOG_REMOTE` is rejected in profile mode, and the old install sync options
+are disabled. Profile and route administration are not granted by allow rules.
+
+The local store becomes `<legacy-store>/profiles/<profile>/<repo-key>/`; without
+an origin the final component is `_no-origin`. Worktree fallbacks and explicit
+`AGENTLOG_DIR` roots use the same suffix. Reads, worktree migration, presence,
+claims, cursors, nudges, GC, locks and throttle timestamps stay inside that board.
+A `.sync-binding` records the profile, repository, transport, destination and
+layout. Changing those settings refuses an existing board; select a new profile
+to start a fresh board. Selecting a different route never transfers history.
+
+New remote boards live at `<remote>/profiles/<profile>/<repo-key>`, while migrated
+ones remain at `<remote>/<repo-key>`. Participating machines must agree on profile
+names and routing. Profiles are routing/isolation boundaries, not authenticated
+tenants; remote ACLs and credentials must enforce organization/repository access.
+
 ## Identity
 
 Each agent's own session environment variable identifies it. They are checked in this order: `ANTIGRAVITY_CONVERSATION_ID`, `MUSE_SESSION_ID`, `CODEX_SESSION_ID` / `CODEX_THREAD_ID`, `OPENCODE_SESSION_ID`, `CURSOR_SESSION_ID`, then `CLAUDE_CODE_SESSION_ID`. An agent started from another agent's shell inherits the outer agent's variable too, and Claude Code's leaks into everything it runs, so it comes last. You can override with `AGENTLOG_SESSION` and `AGENTLOG_AGENT`.

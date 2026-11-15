@@ -203,6 +203,9 @@ s_worktree() {
   git -C "$r" worktree add -q -b e2e-side "$wt" || die "worktree add failed"
   # The main checkout creates the shared store, as an earlier session would have.
   seed "$r" "worktree test starting" >/dev/null
+  # Named profiles add a suffix to both shared and fallback stores.
+  shared_store=$(cd "$r" && "$AL" dir | sed -n '1p')
+  store_suffix=${shared_store#"$r/.agentlog"}
   t1=$(token) t2=$(token)
   codex_run "$wt" "$work/worktree.jsonl" workspace-write \
     "Run exactly these two shell commands, one after the other, then say done:
@@ -218,7 +221,7 @@ $AL write 'via sandbox fallback $t2'"
   # The fallback store's message is gone by now: Codex's unsandboxed PostToolUse
   # hook migrates it into the shared store, so check both halves of that trip.
   check "worktree: sandboxed write fell back to a worktree store" "$work/worktree.jsonl" \
-    test -f "$wt/.agentlog/.agentlog-store"
+    test -f "$wt/.agentlog$store_suffix/.agentlog-store"
   check "worktree: a hook migrated the fallback write to the shared store" "$work/worktree.jsonl" \
     in_store "$r" "$t2"
   check "worktree: main checkout sees both writes, from codex" "$work/worktree.jsonl" \
