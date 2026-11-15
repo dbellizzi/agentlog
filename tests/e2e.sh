@@ -120,8 +120,10 @@ s_simple() {
   check "$agent: SessionStart hook delivers a message (plugin installed and approved?)" \
     "$work/$agent-hook.log" grep -q "$t1" "$work/$agent-hook.log"
   req=$(seed "$r" -k request -t "$agent" "please reply with exactly: $t2")
+  # The hook includes both the request ID and its body. Ask for only the
+  # reply command so a headless run does not wait on unrelated tool approvals.
   "$runner" "$r" "$work/$agent-reply.log" \
-    "Handle any agentlog requests addressed to you, then say done."
+    "Use the agentlog request already provided by the hook. Run exactly one shell command: $INSTALLED write -k reply -r REQUEST_ID 'REQUESTED_TOKEN'. Replace REQUEST_ID and REQUESTED_TOKEN with the ID and token from that request. Then say done."
   check "$agent: answers a request with a reply" "$work/$agent-reply.log" \
     has "$r" ".re == \"$req\" and .agent == \"$agent\" and (.body | contains(\"$t2\"))"
 }
