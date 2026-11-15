@@ -373,6 +373,13 @@ check "profiles: changed origin cannot re-import old board" "[ -z \"\$(on p1 run
 git -C "$root/p1/repo" remote set-url origin 'git@github.com:owner/re?po.git'
 check "profiles: malformed origin does not alias another board" "on p1 \"$AL\" sync status | grep -qx 'repository: _no-origin' && ! on p1 \"$AL\" sync 2>/dev/null"
 
+# Resolve the SSH profile without connecting to a remote in the unit suite.
+on p1 "$AL" profile add ssh-test --remote 'ssh://agent@fixture.invalid/var/agentlog' >/dev/null
+on p1 "$AL" route add 'github.com/ssh-fixture/*' --profile ssh-test >/dev/null
+git -C "$root/p1/repo" remote set-url origin git@github.com:ssh-fixture/repo.git
+ssh_status=$(on p1 "$AL" sync status)
+check "profiles: new SSH profile resolves its routed namespace" "printf '%s\\n' \"\$ssh_status\" | grep -qx 'profile: ssh-test' && printf '%s\\n' \"\$ssh_status\" | grep -qx 'transport: ssh' && printf '%s\\n' \"\$ssh_status\" | grep -qx 'destination: ssh://agent@fixture.invalid/var/agentlog/profiles/ssh-test/github.com/ssh-fixture/repo'"
+
 # --- profile worktrees: the fallback and migration stay in the selected realm
 fresh profilewt
 unset AGENTLOG_DIR

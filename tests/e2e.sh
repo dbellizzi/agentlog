@@ -82,8 +82,8 @@ board() { (cd "$1" && AGENTLOG_AGENT=observer AGENTLOG_SESSION=e2eobsv0 "$AL" re
 has() { board "$1" | jq -e -s "map(select($2)) | length > 0" >/dev/null; }
 has_n() { board "$1" | jq -e -s "map(select($3)) | length == $2" >/dev/null; }
 
-# in_store STORE-PARENT TOKEN : a message file under STORE-PARENT/.agentlog holds TOKEN
-in_store() { grep -rqs "$2" "$1/.agentlog/msgs"; }
+# in_store STORE TOKEN : a message file in the resolved store holds TOKEN
+in_store() { grep -Frqs -- "$2" "$1/msgs"; }
 
 claude_run() { # claude_run DIR LOG BASH(allow|deny) PROMPT
   dir=$1 logf=$2 bash=$3 prompt=$4
@@ -214,7 +214,7 @@ $AL write 'via sandbox fallback $t2'"
 
   if [ -f "$HOME/.codex/rules/agentlog.rules" ]; then
     check "worktree: allow-rule write lands in the shared store" "$work/worktree.jsonl" \
-      in_store "$r" "$t1"
+      in_store "$shared_store" "$t1"
   else
     echo "skip worktree: allow-rule write (no ~/.codex/rules/agentlog.rules)"
   fi
@@ -223,7 +223,7 @@ $AL write 'via sandbox fallback $t2'"
   check "worktree: sandboxed write fell back to a worktree store" "$work/worktree.jsonl" \
     test -f "$wt/.agentlog$store_suffix/.agentlog-store"
   check "worktree: a hook migrated the fallback write to the shared store" "$work/worktree.jsonl" \
-    in_store "$r" "$t2"
+    in_store "$shared_store" "$t2"
   check "worktree: main checkout sees both writes, from codex" "$work/worktree.jsonl" \
     has_n "$r" 2 ".agent == \"codex\" and (.body | contains(\"$t1\") or contains(\"$t2\"))"
 }
