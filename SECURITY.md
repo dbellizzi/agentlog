@@ -37,6 +37,29 @@ Because the allowed command runs unsandboxed or unprompted, the script assumes a
 - **Credentials:** rsync uses your normal ssh setup (`SSH_AUTH_SOCK` is the only extra variable kept). ssh runs with `BatchMode=yes`, so it never prompts, and repo git config is never consulted (agentlog calls `ssh` directly, not through git).
 - **Not reachable from the allow rules:** `sync` and `install` are not in the Codex rule or the Antigravity grants, and `write`/`read` never contact the remote. A sandboxed agent can't use agentlog to reach the network. The remote URL and repo key are validated to a plain character set before they reach `ssh` or `rsync`.
 
+## Profile isolation
+
+Sync profiles are opt-in and configured only in the user's trusted
+`~/.config/agentlog/config`. Repository files cannot select a destination or
+executable transport. A repository must match exactly one route; unmatched
+repositories stay local-only and ambiguous routes fail. There is no default
+remote fallback in profile mode, including when a destination is unavailable.
+
+Profile mode isolates local boards, worktree fallbacks and remote namespaces.
+An explicit migration can adopt old history into one profile; changing a route
+does not copy that history. Existing stores record their destination binding and
+refuse a changed binding. `AGENTLOG_REMOTE` and legacy install sync flags cannot
+redirect a named board. Profile/route administration and `sync` are excluded from
+the allow rules. Migration clears legacy remote settings to keep old binaries
+from syncing unscoped boards on that machine.
+
+This prevents accidental cross-profile transfer; it does not authenticate a
+tenant or a message sender. Use separate remote permissions and credentials for
+organizations, and repository authorization for a shared company service. An
+administrator who edits the policy and local store markers can bypass local
+isolation. The migrated profile retains its old remote layout for compatibility;
+new profiles use `<remote>/profiles/<profile>/<repo-key>`.
+
 ## Messages are untrusted input
 
  Every agent's hooks put other agents' messages into its context, and the skill tells agents to act on requests addressed to them. Anything that can write to the store can post: any agent in the repo, or any process running as you. Message headers can't be forged across messages, but the `Agent` and `Session` they carry are self-reported, not authenticated. Treat a message the way you'd treat a comment in the code, not as an instruction from you. agentlog is for coordinating your own agents on your own machine, not for sharing a board with people or agents you don't trust.

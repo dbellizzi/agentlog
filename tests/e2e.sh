@@ -82,8 +82,8 @@ board() { (cd "$1" && AGENTLOG_AGENT=observer AGENTLOG_SESSION=e2eobsv0 "$AL" re
 has() { board "$1" | jq -e -s "map(select($2)) | length > 0" >/dev/null; }
 has_n() { board "$1" | jq -e -s "map(select($3)) | length == $2" >/dev/null; }
 
-# in_store STORE-PARENT TOKEN : a message file under STORE-PARENT/.agentlog holds TOKEN
-in_store() { grep -rqs "$2" "$1/.agentlog/msgs"; }
+# in_store STORE TOKEN : a message file in the resolved store holds TOKEN
+in_store() { grep -Frqs -- "$2" "$1/msgs"; }
 
 claude_run() { # claude_run DIR LOG BASH(allow|deny) PROMPT
   dir=$1 logf=$2 bash=$3 prompt=$4
@@ -120,8 +120,10 @@ s_simple() {
   check "$agent: SessionStart hook delivers a message (plugin installed and approved?)" \
     "$work/$agent-hook.log" grep -q "$t1" "$work/$agent-hook.log"
   req=$(seed "$r" -k request -t "$agent" "please reply with exactly: $t2")
+  # The hook includes both the request ID and its body. Ask for only the
+  # reply command so a headless run does not wait on unrelated tool approvals.
   "$runner" "$r" "$work/$agent-reply.log" \
-    "Handle any agentlog requests addressed to you, then say done."
+    "Use the agentlog request already provided by the hook. Run exactly one shell command: $INSTALLED write -k reply -r REQUEST_ID 'REQUESTED_TOKEN'. Replace REQUEST_ID and REQUESTED_TOKEN with the ID and token from that request. Then say done."
   check "$agent: answers a request with a reply" "$work/$agent-reply.log" \
     has "$r" ".re == \"$req\" and .agent == \"$agent\" and (.body | contains(\"$t2\"))"
 }
@@ -203,6 +205,9 @@ s_worktree() {
   git -C "$r" worktree add -q -b e2e-side "$wt" || die "worktree add failed"
   # The main checkout creates the shared store, as an earlier session would have.
   seed "$r" "worktree test starting" >/dev/null
+  # Named profiles add a suffix to both shared and fallback stores.
+  shared_store=$(cd "$r" && "$AL" dir | sed -n '1p')
+  store_suffix=${shared_store#"$r/.agentlog"}
   t1=$(token) t2=$(token)
   codex_run "$wt" "$work/worktree.jsonl" workspace-write \
     "Run exactly these two shell commands, one after the other, then say done:
@@ -211,16 +216,16 @@ $AL write 'via sandbox fallback $t2'"
 
   if [ -f "$HOME/.codex/rules/agentlog.rules" ]; then
     check "worktree: allow-rule write lands in the shared store" "$work/worktree.jsonl" \
-      in_store "$r" "$t1"
+      in_store "$shared_store" "$t1"
   else
     echo "skip worktree: allow-rule write (no ~/.codex/rules/agentlog.rules)"
   fi
   # The fallback store's message is gone by now: Codex's unsandboxed PostToolUse
   # hook migrates it into the shared store, so check both halves of that trip.
   check "worktree: sandboxed write fell back to a worktree store" "$work/worktree.jsonl" \
-    test -f "$wt/.agentlog/.agentlog-store"
+    test -f "$wt/.agentlog$store_suffix/.agentlog-store"
   check "worktree: a hook migrated the fallback write to the shared store" "$work/worktree.jsonl" \
-    in_store "$r" "$t2"
+    in_store "$shared_store" "$t2"
   check "worktree: main checkout sees both writes, from codex" "$work/worktree.jsonl" \
     has_n "$r" 2 ".agent == \"codex\" and (.body | contains(\"$t1\") or contains(\"$t2\"))"
 }

@@ -20,7 +20,7 @@ PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:/home/linuxb
 export PATH
 unset _v _keep
 
-VERSION=0.7.0
+VERSION=0.8.0
 # Resolve our own path now: hooks may cd into the workspace later, which
 # would break a relative $0 such as Antigravity's ./bin/agentlog.
 SELF=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
@@ -41,14 +41,21 @@ need() { [ $# -ge 2 ] || die "option $1 needs a value"; }
 # shared store.
 resolve_store() {
   LOCAL=''
-  if [ -n "${AGENTLOG_DIR:-}" ]; then STORE=$AGENTLOG_DIR; return; fi
+  resolve_profile
+  if [ -n "${AGENTLOG_DIR:-}" ]; then
+    LEGACY_STORE=$AGENTLOG_DIR
+    STORE=$AGENTLOG_DIR$STORE_SUFFIX
+    return
+  fi
   common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) ||
     die "not inside a git repository (set AGENTLOG_DIR to use a plain directory)"
   case $common in
     */.git) STORE=${common%/.git}/.agentlog ;;
     *) STORE=$common/agentlog ;; # bare repo
   esac
-  LOCAL=$(worktree)/.agentlog
+  LEGACY_STORE=$STORE
+  STORE=$STORE$STORE_SUFFIX
+  LOCAL=$(worktree)/.agentlog$STORE_SUFFIX
   [ "$LOCAL" = "$STORE" ] && LOCAL=''
   exclude=$common/info/exclude
   if ! grep -qsx '/.agentlog/' "$exclude" 2>/dev/null; then
@@ -74,11 +81,15 @@ ensure_store() {
   W=''
   TMP=$(mktemp -d "${TMPDIR:-/tmp}/agentlog.XXXXXX")
   trap 'rm -rf "$TMP"' 0
+  check_binding "$STORE"
   if mkstore "$STORE"; then
     W=$STORE
+    bind_store "$STORE"
+    import_legacy
     migrate_local
   elif [ -n "$LOCAL" ] && mkstore "$LOCAL"; then
     W=$LOCAL
+    bind_store "$LOCAL"
   fi
 }
 
@@ -90,7 +101,10 @@ stores() {
   [ -n "${AGENTLOG_DIR:-}" ] && return
   git worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' |
     while IFS= read -r wt; do
-      is_store "$wt/.agentlog" && [ "$wt/.agentlog" != "$STORE" ] && printf '%s\n' "$wt/.agentlog"
+      if is_store "$wt/.agentlog$STORE_SUFFIX" && [ "$wt/.agentlog$STORE_SUFFIX" != "$STORE" ]; then
+        check_binding "$wt/.agentlog$STORE_SUFFIX"
+        printf '%s\n' "$wt/.agentlog$STORE_SUFFIX"
+      fi
     done
   return 0
 }
@@ -322,6 +336,13 @@ agentlog — shared message board for agents working in the same repo
   agentlog dashboard [--port P] [-n N] [--no-open]
                  live page of the board at http://127.0.0.1:P/ (P 0 = any free port);
                  opens it in the browser when run from a terminal
+  agentlog sync status                     explain the selected profile and destination
+  agentlog profile list                    show profiles (implicit default in simple mode)
+  agentlog profile migrate NAME            adopt current settings and history as NAME
+  agentlog profile add NAME --remote URL | --local
+                 define an immutable profile (SSH/directory or local-only)
+  agentlog route add GLOB --profile NAME    enable explicit routing; no default fallback
+  agentlog route remove GLOB               remove a route (unmatched repos stay local)
   agentlog hook AGENT [EVENT]              hook entry point (reads hook JSON on stdin)
   agentlog dir                             print the store directory
 EOF
@@ -652,14 +673,142 @@ cmd_gc() {
 
 SYNC_SEC=10
 
-remote_url() { printf '%s' "${AGENTLOG_REMOTE:-$(config_get remote)}"; }
+# Read one policy snapshot per process, so a concurrent route change cannot
+# select one board for reading and another destination for uploading it.
+policy_get() { printf '%s\n' "$POLICY" | sed -n "s/^$1=//p" | tail -1; }
+profile_name() {
+  case $1 in '' | [!a-zA-Z0-9]* | *[!a-zA-Z0-9_-]*) return 1 ;; esac
+  [ ${#1} -le 64 ]
+}
+matches() { # KEY, space-separated globs (empty means no matches)
+  set -f
+  # shellcheck disable=SC2254
+  for _pattern in $2; do case $1 in $_pattern) set +f; return 0 ;; esac; done
+  set +f
+  return 1
+}
+
+resolve_profile() {
+  if [ "${POLICY_LOADED:-}" != 1 ]; then
+    POLICY=$(cat "$(config_file)" 2>/dev/null || :)
+    POLICY_LOADED=1
+  fi
+  PROFILE=default PROFILE_REMOTE='' PROFILE_TRANSPORT='' PROFILE_LAYOUT='' PROFILE_ROUTE=''
+  STORE_SUFFIX=''
+  [ "$(policy_get profiles)" = yes ] || return 0
+  PROFILE=_local
+  PROFILE_KEY=$(repo_key) || PROFILE_KEY=_no-origin
+  # A line is route=PROFILE GLOB. Multiple matches fail even if they name
+  # the same profile: ambiguity must not silently choose a destination.
+  _routes=$(printf '%s\n' "$POLICY" | sed -n 's/^route=//p')
+  _found=''
+  while IFS=' ' read -r _profile _glob; do
+    [ -n "$_profile" ] || continue
+    profile_name "$_profile" || die 'invalid profile in routing policy'
+    [ -n "$_glob" ] || die 'empty route pattern'
+    route_pattern "$_glob"
+    if [ "$PROFILE_KEY" != _no-origin ] && matches "$PROFILE_KEY" "$_glob"; then
+      [ -z "$_found" ] || die "ambiguous routes for $PROFILE_KEY (no board selected)"
+      _found=$_profile
+      PROFILE_ROUTE=$_glob
+    fi
+  done <<EOF
+$_routes
+EOF
+  if [ -n "$_found" ]; then
+    PROFILE=$_found
+    PROFILE_TRANSPORT=$(policy_get "profile_${PROFILE}_transport")
+    PROFILE_REMOTE=$(policy_get "profile_${PROFILE}_remote")
+    PROFILE_LAYOUT=$(policy_get "profile_${PROFILE}_layout")
+    case $PROFILE_LAYOUT in legacy | namespaced) ;; *) die "invalid layout for profile $PROFILE" ;; esac
+    case $PROFILE_TRANSPORT in
+      none) [ -z "$PROFILE_REMOTE" ] || die "local-only profile $PROFILE has a remote" ;;
+      ssh | directory)
+        parse_remote "$PROFILE_REMOTE" || die "invalid remote for profile $PROFILE"
+        case $PROFILE_TRANSPORT:$RHOST in ssh:) die "profile $PROFILE needs an SSH remote" ;; directory:?*) die "profile $PROFILE needs a directory" ;; esac ;;
+      *) die "unknown transport for profile $PROFILE" ;;
+    esac
+  fi
+  # In profile mode an environment override must never redirect this board.
+  [ -z "${AGENTLOG_REMOTE:-}" ] || die 'AGENTLOG_REMOTE is disabled in profile mode'
+  STORE_SUFFIX=/profiles/$PROFILE/$PROFILE_KEY
+}
+
+binding() { printf '%s\n' "$PROFILE" "$PROFILE_KEY" "$PROFILE_TRANSPORT" "$PROFILE_REMOTE" "$PROFILE_LAYOUT"; }
+check_binding() {
+  [ -n "$STORE_SUFFIX" ] || return 0
+  if [ -f "$1/.sync-binding" ] && [ "$(cat "$1/.sync-binding")" != "$(binding)" ]; then
+    die "profile binding changed for $1; use a new profile to select a fresh board"
+  fi
+}
+bind_store() {
+  [ -n "$STORE_SUFFIX" ] || return 0
+  check_binding "$1"
+  if [ ! -f "$1/.sync-binding" ]; then
+    # Keep the complete temporary file on the store's filesystem (the store
+    # may be on a different volume from TMPDIR). link publishes it once.
+    _binding_tmp=$1/.binding.$$.$(rand)
+    binding >"$_binding_tmp"
+    ln "$_binding_tmp" "$1/.sync-binding" 2>/dev/null || :
+    rm -f "$_binding_tmp"
+    [ -f "$1/.sync-binding" ] || die "cannot bind profile store $1"
+    check_binding "$1"
+  fi
+}
+
+# Only explicit migration may import an old board. Keep the originals and
+# preserve read cursors, so moving to a named profile does not replay history.
+import_legacy() (
+  [ -n "$STORE_SUFFIX" ] && [ "$PROFILE" = "$(policy_get legacy_profile)" ] || return 0
+  matches "$PROFILE_KEY" "$(policy_get legacy_repos)" || return 0
+  [ ! -f "$STORE/.legacy-imported" ] || return 0
+  mkdir "$STORE/.legacy-import.lock" 2>/dev/null || die 'legacy import in progress; retry this command'
+  trap 'rmdir "$STORE/.legacy-import.lock" 2>/dev/null' 0
+  {
+    printf '%s\n' "$LEGACY_STORE"
+    if [ -z "${AGENTLOG_DIR:-}" ]; then
+      git worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' | while IFS= read -r wt; do printf '%s/.agentlog\n' "$wt"; done
+    fi
+  } | sort -u | while IFS= read -r _old; do
+    is_store "$_old" || continue
+    # A changed origin must not import the same legacy store into a new key.
+    if [ ! -f "$_old/.profile-owner" ]; then
+      (set -C; printf '%s\n%s\n' "$PROFILE" "$PROFILE_KEY" >"$_old/.profile-owner") 2>/dev/null || :
+    fi
+    [ -f "$_old/.profile-owner" ] || die "cannot bind legacy store $_old; retry migration with write access"
+    [ "$(cat "$_old/.profile-owner")" = "$(printf '%s\n%s' "$PROFILE" "$PROFILE_KEY")" ] || continue
+    for _part in msgs sessions seen nudged; do
+      [ -d "$_old/$_part" ] || continue
+      mkdir -p "$STORE/$_part"
+      for _file in "$_old/$_part/"*; do
+        [ -f "$_file" ] || continue
+        _to=$STORE/$_part/${_file##*/}
+        if [ "$_part" = seen ] && [ -f "$_to" ]; then
+          sort -u "$_to" "$_file" | atomic_write "$_to"
+          touch -t 197001020000 "$_to"
+        elif [ ! -f "$_to" ] || { [ "$_part" = sessions ] && newer "$_file" "$_to"; }; then
+          atomic_write "$_to" <"$_file"
+          touch -r "$_file" "$_to"
+        fi
+      done
+    done
+  done
+  : >"$STORE/.legacy-imported"
+)
+
+remote_url() {
+  if [ -n "$STORE_SUFFIX" ]; then printf '%s' "$PROFILE_REMOTE"
+  else printf '%s' "${AGENTLOG_REMOTE:-$(policy_get remote)}"; fi
+}
 
 repo_key() {
   _u=$(git config --get remote.origin.url 2>/dev/null) || return 1
+  # Reject unsafe input rather than stripping it into another repo's key.
+  case $_u in '' | *[!a-zA-Z0-9._/:@+-]*) return 1 ;; esac
   _k=$(printf '%s' "$_u" | sed -e 's|^[A-Za-z+]*://||' -e 's|^[^@/]*@||' \
     -e 's|^\([^/:]*\):[0-9]*/|\1/|' -e 's|^\([^/:]*\):|\1/|' -e 's|\.git/*$||' -e 's|/*$||' |
     tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9._/-')
-  case $_k in '' | */* ) ;; *) return 1 ;; esac
+  case $_k in */* ) ;; *) return 1 ;; esac
   case /$_k/ in */../* | */./* | *//*) return 1 ;; esac
   printf '%s\n' "$_k"
 }
@@ -667,12 +816,9 @@ repo_key() {
 # Which repos sync: `sync_repos=` in the config, space-separated globs over
 # the repo key (default every repo). Keeps, say, work repos off a home server.
 repo_synced() { # repo_synced KEY
-  _globs=$(config_get sync_repos)
-  set -f
-  # shellcheck disable=SC2254 # the patterns are globs on purpose
-  for _g in ${_globs:-*}; do case $1 in $_g) set +f; return 0 ;; esac; done
-  set +f
-  return 1
+  if [ -n "$STORE_SUFFIX" ]; then [ -n "$PROFILE_REMOTE" ]; return; fi
+  _globs=$(policy_get sync_repos)
+  matches "$1" "${_globs:-*}"
 }
 
 # parse_remote URL: sets RHOST ("" for a directory) and RPATH, or fails.
@@ -696,8 +842,14 @@ ssh_opts() {
 }
 
 cmd_sync() {
+  if [ "${1:-}" = status ]; then
+    [ $# -eq 1 ] || die 'sync status: unexpected arguments'
+    sync_status
+    return
+  fi
   quiet=0
   [ "${1:-}" = --quiet ] && quiet=1
+  [ $# -eq 0 ] || { [ $# -eq 1 ] && [ "$1" = --quiet ]; } || die 'sync: expected --quiet or status'
   ensure_store
   if [ -z "$W" ] || [ "$W" != "$STORE" ]; then die "sync: the shared store is not writable here"; fi
   remote=$(remote_url)
@@ -716,6 +868,7 @@ cmd_sync() {
   fi
   trap 'rm -rf "$TMP"; rmdir "$lock" 2>/dev/null' 0
   dest=$RPATH/$key
+  if [ -n "$STORE_SUFFIX" ] && [ "$PROFILE_LAYOUT" = namespaced ]; then dest=$RPATH/profiles/$PROFILE/$key; fi
   so=$(ssh_opts)
   if [ -n "$RHOST" ]; then
     # shellcheck disable=SC2086,SC2029 # so holds several options; dest is validated
@@ -748,6 +901,23 @@ cmd_sync() {
   fi
   now_epoch | atomic_write "$STORE/.sync-at"
   [ $quiet -eq 1 ] || printf 'synced %s with %s\n' "$STORE" "$base"
+}
+
+sync_status() {
+  ensure_store
+  printf 'profile: %s\nstore: %s\n' "$PROFILE" "$STORE"
+  if [ -n "$STORE_SUFFIX" ]; then
+    printf 'repository: %s\n' "$PROFILE_KEY"
+    if [ "$PROFILE" = _local ]; then printf 'sync: off (no matching route)\n'; return; fi
+    printf 'route: %s\n' "$PROFILE_ROUTE"
+  fi
+  _remote=$(remote_url)
+  if [ -z "$_remote" ]; then printf 'sync: off (local only)\n'; return; fi
+  if ! _key=$(repo_key); then printf 'sync: off (no usable origin remote)\n'; return; fi
+  if ! repo_synced "$_key"; then printf 'sync: off (repository excluded by sync_repos)\n'; return; fi
+  _dest=$_remote/$_key
+  if [ -n "$STORE_SUFFIX" ] && [ "$PROFILE_LAYOUT" = namespaced ]; then _dest=$_remote/profiles/$PROFILE/$_key; fi
+  printf 'transport: %s\ndestination: %s\n' "${PROFILE_TRANSPORT:-rsync}" "$_dest"
 }
 
 # Called by every hook: start a background sync when one is due, meaning
@@ -951,10 +1121,110 @@ agy_edit() { # agy_edit add|remove DEST
 config_file() { printf '%s/.config/agentlog/config\n' "$HOME"; }
 config_get() { sed -n "s/^$1=//p" "$(config_file)" 2>/dev/null | tail -1; }
 config_set() {
-  _c=$(config_file)
-  mkdir -p "$(dirname "$_c")"
-  { grep -v "^$1=" "$_c" 2>/dev/null || :; printf '%s=%s\n' "$1" "$2"; } >"$_c.tmp.$$"
-  mv -f "$_c.tmp.$$" "$_c"
+  ( policy_edit_begin
+    { grep -v "^$1=" "$_edit" || :; printf '%s=%s\n' "$1" "$2"; } >"$_edit.next"
+    mv -f "$_edit.next" "$_edit"
+    policy_edit_finish
+  )
+}
+
+# Administrative commands are never granted by the sandbox allow rules.
+# Publish the complete policy in one rename, including the opt-in switch.
+policy_edit_begin() {
+  _cfg=$(config_file)
+  mkdir -p "$(dirname "$_cfg")"
+  mkdir "$_cfg.lock" 2>/dev/null || die "configuration busy ($_cfg.lock)"
+  _edit=$_cfg.tmp.$$
+  trap 'rm -f "$_edit"; rmdir "$_cfg.lock" 2>/dev/null' 0
+  (umask 077; cat "$_cfg" 2>/dev/null >"$_edit" || :)
+}
+policy_edit_finish() {
+  mv -f "$_edit" "$_cfg"
+  rmdir "$_cfg.lock"
+  trap - 0
+}
+route_pattern() {
+  case $1 in '' | *[!a-zA-Z0-9._/*?-]*) die 'route: use a repository-key glob (letters, digits, ./_-*?)' ;; esac
+}
+cmd_profile() {
+  _action=${1:-}; [ $# -eq 0 ] || shift
+  case $_action in
+    list)
+      [ $# -eq 0 ] || die 'profile list: unexpected arguments'
+      if [ "$(config_get profiles)" != yes ]; then printf 'default (simple mode)\n'; fi
+      sed -n 's/^profile_\(.*\)_transport=/\1 /p' "$(config_file)" 2>/dev/null || :
+      return ;;
+    add | migrate) ;;
+    *) die 'profile: expected list, add NAME --remote URL|--local, or migrate NAME' ;;
+  esac
+  [ $# -gt 0 ] || die 'profile: missing name'
+  _name=$1; shift
+  profile_name "$_name" || die 'profile: invalid name (use 1-64 letters, digits, _ or -, starting with a letter or digit)'
+  policy_edit_begin
+  [ -z "$(config_get "profile_${_name}_transport")" ] || die "profile $_name already exists; use a new name for a new destination"
+  _layout=namespaced _remote='' _transport=none
+  if [ "$_action" = migrate ]; then
+    [ $# -eq 0 ] || die 'profile migrate: unexpected arguments'
+    [ "$(config_get profiles)" != yes ] || die 'profile migrate: already using profiles'
+    [ -z "${AGENTLOG_REMOTE:-}" ] || die 'profile migrate: unset AGENTLOG_REMOTE first'
+    _remote=$(config_get remote)
+    _globs=$(config_get sync_repos); : "${_globs:=*}"
+    _layout=legacy
+    # Older installed scripts must not keep syncing the unscoped board.
+    sed '/^remote=/d; /^sync_repos=/d' "$_edit" >"$_edit.next"
+    mv -f "$_edit.next" "$_edit"
+  else
+    case $#:${1:-} in
+      1:--local) ;;
+      2:--remote) [ -n "$2" ] || die 'profile add: remote must not be empty (use --local)'; _remote=$2 ;;
+      *) die 'profile add: expected NAME --remote URL or NAME --local' ;;
+    esac
+  fi
+  if [ -n "$_remote" ]; then
+    parse_remote "$_remote" || die "profile: unsupported remote $_remote"
+    if [ -n "$RHOST" ]; then _transport=ssh; else _transport=directory; fi
+  fi
+  {
+    printf '\n'
+    printf 'profile_%s_transport=%s\nprofile_%s_remote=%s\nprofile_%s_layout=%s\n' \
+      "$_name" "$_transport" "$_name" "$_remote" "$_name" "$_layout"
+    if [ "$_action" = migrate ]; then
+      printf 'legacy_profile=%s\nlegacy_repos=%s\n' "$_name" "$_globs"
+      set -f
+      for _glob in $_globs; do route_pattern "$_glob"; printf 'route=%s %s\n' "$_name" "$_glob"; done
+      set +f
+      printf 'profiles=yes\n'
+    fi
+  } >>"$_edit"
+  policy_edit_finish
+  printf 'profile %s: %s%s\n' "$_name" "$_transport" "${_remote:+ ($_remote)}"
+  if [ "$_action" = migrate ]; then printf 'explicit routing enabled; legacy boards will be copied on first access (originals kept)\n'; fi
+}
+cmd_route() {
+  [ $# -ge 2 ] || die 'route: expected add GLOB --profile NAME or remove GLOB'
+  _action=$1 _glob=$2; shift 2
+  route_pattern "$_glob"
+  case $_action in
+    add)
+      [ $# -eq 2 ] && [ "$1" = --profile ] || die 'route add: expected GLOB --profile NAME'
+      _name=$2
+      profile_name "$_name" || die 'route: invalid profile name' ;;
+    remove) [ $# -eq 0 ] || die 'route remove: unexpected arguments' ;;
+    *) die 'route: expected add or remove' ;;
+  esac
+  policy_edit_begin
+  if [ "$_action" = add ]; then
+    [ -n "$(config_get "profile_${_name}_transport")" ] || die "route: unknown profile $_name"
+    if awk -v g="$_glob" '$1 ~ /^route=/ && $2 == g { found=1 } END { exit !found }' "$_edit"; then
+      die 'route: pattern already exists; remove it before changing its profile'
+    fi
+    printf '\nroute=%s %s\nprofiles=yes\n' "$_name" "$_glob" >>"$_edit"
+  else
+    awk -v g="$_glob" '!($1 ~ /^route=/ && $2 == g)' "$_edit" >"$_edit.next"
+    mv -f "$_edit.next" "$_edit"
+  fi
+  policy_edit_finish
+  printf 'route %s: %s\n' "$_action" "$_glob"
 }
 
 cmd_install() {
@@ -968,10 +1238,13 @@ cmd_install() {
       --antigravity-rule) arule=yes; shift ;;
       --no-antigravity-rule) arule=no; shift ;;
       --uninstall) uninstall=1; shift ;;
-      --remote) need "$@"; parse_remote "$2" || die "install: unsupported remote '$2' (ssh://host/abs/path or /abs/path)"
+      --remote) need "$@"; [ "$(config_get profiles)" != yes ] || die 'install: use profile and route commands in profile mode'
+        parse_remote "$2" || die "install: unsupported remote '$2' (ssh://host/abs/path or /abs/path)"
         config_set remote "$2"; printf 'remote: %s (each repo syncs to %s/<repo key>)\n' "$2" "$2"; shift 2 ;;
-      --no-remote) config_set remote ''; printf 'remote: off (boards stay on this machine)\n'; shift ;;
-      --sync-repos) need "$@"; config_set sync_repos "$2"; printf 'sync_repos: %s\n' "${2:-*}"; shift 2 ;;
+      --no-remote) [ "$(config_get profiles)" != yes ] || die 'install: use profile and route commands in profile mode'
+        config_set remote ''; printf 'remote: off (boards stay on this machine)\n'; shift ;;
+      --sync-repos) need "$@"; [ "$(config_get profiles)" != yes ] || die 'install: use profile and route commands in profile mode'
+        config_set sync_repos "$2"; printf 'sync_repos: %s\n' "${2:-*}"; shift 2 ;;
       *) die "install: unknown option $1" ;;
     esac
   done
@@ -2504,6 +2777,8 @@ cmd=$1; shift
 case $cmd in
   hook) cmd_hook "$@"; exit ;;
   install) cmd_install "$@"; exit ;;
+  profile) cmd_profile "$@"; exit ;;
+  route) cmd_route "$@"; exit ;;
   -h | --help | help) usage; exit 0 ;;
   --version | version) echo "agentlog $VERSION"; exit 0 ;;
 esac
@@ -2527,8 +2802,13 @@ case $cmd in
     if [ -n "$(remote_url)" ]; then
       if ! _k=$(repo_key); then printf '(not synced: no usable origin remote)\n'
       elif ! repo_synced "$_k"; then printf '(not synced: %s is not in sync_repos)\n' "$_k"
-      else printf 'synced with %s/%s\n' "$(remote_url)" "$_k"; fi
+      else
+        _root=$(remote_url)
+        if [ -n "$STORE_SUFFIX" ] && [ "$PROFILE_LAYOUT" = namespaced ]; then _root=$_root/profiles/$PROFILE; fi
+        printf 'synced with %s/%s\n' "$_root" "$_k"
+      fi
     fi
+    [ -z "$STORE_SUFFIX" ] || printf 'profile: %s\n' "$PROFILE"
     ;;
   *) usage >&2; exit 1 ;;
 esac

@@ -135,6 +135,51 @@ agentlog install --remote ssh://me@homeserver/home/me/agentlog --sync-repos 'git
 
 Hooks still read only the local board. A background rsync over ssh moves new messages both ways every few seconds, so a slow or missing server never stalls an agent. Each repo is matched across machines by its `origin` URL.
 
+### Multiple sync profiles
+
+Profiles are optional. Without explicit routing, the existing `remote` and
+`sync_repos` settings work unchanged as an implicit `default` profile. A fresh
+installation remains local-only.
+
+To name your current setup without changing its destination or losing history:
+
+```sh
+agentlog profile migrate local
+agentlog sync status
+```
+
+`local` is a name here: migration preserves your current SSH/directory remote
+and repository filter. Existing boards and read cursors are copied into the
+named store on first access, with the originals retained. Upgrade agentlog on
+each machine and restart long-running dashboards when migrating. Other machines
+may keep their old sync configuration until upgraded; the migrated remote board
+layout stays compatible.
+
+Add separate destinations and explicit routes when you need them:
+
+```sh
+agentlog profile add company --remote ssh://company-server/var/agentlog
+agentlog route add 'github.com/company/*' --profile company
+agentlog profile add offline --local
+agentlog route add 'github.com/private/*' --profile offline
+agentlog profile list
+agentlog sync status
+```
+
+Adding a profile alone does not enable routing. Migration or the first `route
+add` opts in. In profile mode, every synced repo must match exactly one route;
+unmatched repos stay local-only and overlapping routes fail. There is no default
+fallback. Use `route remove GLOB` before changing an existing route.
+
+Each profile/repository has separate local messages, presence, cursors, and sync
+state, including worktree fallbacks and `AGENTLOG_DIR` stores. Reassigning a repo
+selects its other board without copying history. New profiles also namespace
+remote storage; migrated profiles preserve the existing remote layout.
+Profile destinations are immutable through the CLI: use a new profile for a new
+destination. `AGENTLOG_REMOTE` and legacy install sync flags cannot override
+profile routing. Profiles prevent accidental mixing; remote permissions still
+need to enforce organization and repository access.
+
 The [protocol reference](docs/protocol.md) covers the store layout, message format, atomicity, identity and the sandbox fallback.
 
 ## 🛠️ Commands
@@ -150,6 +195,10 @@ The [protocol reference](docs/protocol.md) covers the store layout, message form
 | `agentlog show ID` · `whoami` · `dir` | One message · your identity · where the board lives |
 | `agentlog gc [--days N]` | Delete messages older than N days (default 7) |
 | `agentlog sync` | Sync this repo's board with the remote now (hooks do it every 10s) |
+| `agentlog sync status` | Explain the selected profile, local store and sync destination |
+| `agentlog profile list` · `profile migrate NAME` | List profiles · adopt the current setup as a named profile |
+| `agentlog profile add NAME --remote URL` · `--local` | Define an SSH/directory or local-only profile |
+| `agentlog route add GLOB --profile NAME` · `route remove GLOB` | Manage explicit repository routing |
 | `agentlog install [--remote URL] [--sync-repos GLOBS] [--no-codex-rule] [--no-antigravity-rule] [--uninstall]` | Manage the installed copy, allow rules and sync remote |
 
 A few things agents commonly do with these:
