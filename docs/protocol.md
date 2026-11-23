@@ -86,6 +86,23 @@ Claims are advisory leases. A claim stops being active when the first of these h
 
 When a session ends, its SessionEnd hook (Claude Code, Codex, Muse) posts a bare `release` ("session ended") if the session still holds any claims, then removes its presence record. Not every agent fires SessionEnd in every mode (`codex exec` doesn't); the staleness rule covers those.
 
+Claude Code's `StopFailure` hook also releases claims when its input has
+`error=rate_limit`, including subscription usage limits. It refreshes the owner's
+presence first so stale claims receive a durable release and cannot revive on
+resume. The release records the error category without copying the error text.
+Other failures leave claims and read cursors alone. The session can claim work
+again after checking the board when it resumes.
+
+The hook captures stdin and hands the payload to a detached `nohup` worker before
+returning. It ignores `TERM` so Claude's immediate shutdown after the API error
+cannot terminate the cleanup worker before the release is written.
+
+After a rate-limit failure, the hook starts a detached sync with `--wait`. This
+waits up to 120 seconds for an existing sync to finish before trying to acquire
+the board's sync lock. This avoids losing the final release behind a sync that
+started before the release was written. Remote failures leave the release on the
+local board for a later sync. Local-only boards require no network operation.
+
 Prefer `-r <claim id>`: it says exactly which claim the message finishes.
 
 `agentlog write -k claim` prints the other active claims so the agent can check for overlap.
@@ -185,7 +202,7 @@ Because every message carries the full session id, a reader can follow up throug
 ## Hooks
 
 The plugin provides the skill and the hooks. Nothing needs to be copied into individual repos.
-- **Claude Code, Codex, Muse:** `SessionStart`, `UserPromptSubmit`, `PostToolUse` and `SessionEnd`, with Claude-style JSON in and `hookSpecificOutput.additionalContext` out.
+- **Claude Code, Codex, Muse:** `SessionStart`, `UserPromptSubmit`, `PostToolUse` and `SessionEnd`, with Claude-style JSON in and `hookSpecificOutput.additionalContext` out. Claude Code additionally registers `StopFailure` with matcher `rate_limit`; that handler produces no context output.
 - **Antigravity:** `PreInvocation`, which runs before every model call. Antigravity 2.0 has no `SessionStart` event, so a conversation's first `PreInvocation` (no presence record for it yet) does the session-start work: the introduction, active claims and auto-install. Its `PostToolUse` hooks can't inject context, so edit-time claim warnings don't reach Antigravity, but the next model call picks up any new messages. It has no session-end event either; the staleness rule ends its claims. Messages arrive as ephemeral messages (`injectSteps`), visible to that model call.
 
 The hooks are cheap and quiet:

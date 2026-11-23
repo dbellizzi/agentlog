@@ -249,6 +249,28 @@ n=$(find "$AGENTLOG_DIR/msgs" -type f | wc -l)
 hj aaaa1111 SessionEnd | "$AL" hook claude-code >/dev/null
 check "presence: SessionEnd with nothing held posts nothing" "[ \"\$(find \"$AGENTLOG_DIR/msgs\" -type f | wc -l)\" -eq $n ]"
 
+# --- quota failures release only the affected owner's claims, durably
+fresh stopfailure
+hj quota001 SessionStart | "$AL" hook claude-code >/dev/null
+run claude-code quota001 write -k claim -p 'quota/**' 'quota owner' >/dev/null
+run codex other001 write -k claim -p 'other/**' 'other owner' >/dev/null
+failure() { printf '{"session_id":"quota001","hook_event_name":"StopFailure","error":"%s"}' "$1"; }
+check "quota: unrelated failure leaves claims held" "[ -z \"\$(failure server_error | \"$AL\" hook claude-code)\" ] && run observer obs00001 claims | grep -q 'quota/'"
+# An unrelated message must remain unread by the blocked session.
+run codex other001 write -t quota001 'unread during quota failure' >/dev/null
+check "quota: missing session cannot release inherited owner's claims" "printf '{\"hook_event_name\":\"StopFailure\",\"error\":\"rate_limit\"}' | AGENTLOG_SESSION=quota001 \"$AL\" hook claude-code >/dev/null && run observer obs00001 claims | grep -q 'quota/'"
+touch -t 202001010000 "$AGENTLOG_DIR/sessions/quota001"
+check "quota: failure handler stays silent" "[ -z \"\$(failure rate_limit | \"$AL\" hook claude-code)\" ]"
+check "quota: release is recorded for stale owner" "run observer obs00001 read --all --json --peek | jq -e 'select(.kind == \"release\" and .session == \"quota001\" and (.body | contains(\"rate_limit\")))' >/dev/null"
+check "quota: other sessions keep their claims" "run observer obs00001 claims | grep -q 'other/' && ! run observer obs00001 claims | grep -q 'quota/'"
+check "quota: release does not consume unread messages" "run claude-code quota001 read | grep -q 'unread during quota failure'"
+check "quota: waking up does not revive released claims" "hj quota001 UserPromptSubmit | \"$AL\" hook claude-code >/dev/null && ! run observer obs00001 claims | grep -q 'quota/'"
+n=$(find "$AGENTLOG_DIR/msgs" -name '*.msg' | wc -l)
+failure rate_limit | "$AL" hook claude-code
+check "quota: duplicate failures do not post duplicate releases" "[ \"\$(find \"$AGENTLOG_DIR/msgs\" -name '*.msg' | wc -l)\" -eq $n ]"
+run claude-code quota001 write -k claim -p 'quota/**' 'reclaimed on resume' >/dev/null
+check "quota: resumed session can claim again" "run observer obs00001 claims | grep -q 'quota/'"
+
 # --- sync: two "machines" (own HOME, store and clone) share a board through a remote
 fresh sync
 rem=$root/remote
@@ -300,6 +322,21 @@ check "sync: sync_repos keeps other repos off the remote" "on m1 run x xxxx0000 
 check "sync: sync_repos globs match the repo key" "on m1 run x xxxx0000 install --sync-repos 'gitlab.com/x github.com/owner/*' >/dev/null && on m1 run x xxxx0000 sync --quiet"
 git -C "$root/m2/repo" remote remove origin
 check "sync: a repo without origin says why it can't sync" "on m2 run codex bbbb2222 sync 2>&1 | grep -q 'no usable origin'"
+
+# A rate-limit release must sync even if the prior sync is still running.
+git -C "$root/m2/repo" remote add origin git@github.com:owner/repo.git
+on m1 run claude-code quota001 write -k claim -p 'quota/**' 'remote quota claim' >/dev/null
+on m1 run claude-code quota001 sync --quiet
+on m2 run codex other001 sync --quiet
+mkdir "$root/m1/store/.sync.lock"
+printf '{"session_id":"quota001","hook_event_name":"StopFailure","error":"rate_limit"}' | on m1 "$AL" hook claude-code
+sleep 1
+rmdir "$root/m1/store/.sync.lock"
+i=0
+while [ $i -lt 100 ] && ! grep -qs 'session stopped: rate_limit' "$rem/github.com/owner/repo/msgs/"*.msg; do sleep 0.1; i=$((i + 1)); done
+check "quota: final release sync waits for in-progress sync" "grep -qs 'session stopped: rate_limit' '$rem/github.com/owner/repo/msgs/'*.msg"
+on m2 run codex other001 sync --quiet
+check "quota: peer observes released claim without another sender hook" "! on m2 run codex other001 claims | grep -q 'quota/'"
 
 # --- profiles: migrate two machines, isolate boards and fail closed
 fresh profiles
@@ -686,9 +723,9 @@ hook_cmds_ok() { # hook_cmds_ok HOOKS-JSON AGENT
   jq -e '.hooks | has("SessionStart") and has("UserPromptSubmit") and has("PostToolUse") and has("SessionEnd")' "$1" >/dev/null || return 1
   [ "$(jq '[.. | .command? // empty] | length' "$1")" -ge 4 ] || return 1
   jq -r '.. | .command? // empty' "$1" | while IFS= read -r c; do
-    p=$(printf '%s\n' "$c" | sed -n 's/^"\([^"]*\)".*/\1/p' | sed "s|\${CLAUDE_PLUGIN_ROOT}|$pl|")
+    p=$(printf '%s\n' "$c" | sed -n 's/.*"\([^"]*\/bin\/agentlog\)".*/\1/p' | sed "s|\${CLAUDE_PLUGIN_ROOT}|$pl|")
     [ "$p" = "$pl/bin/agentlog" ] && [ -x "$p" ] || exit 1
-    case $c in *" hook $2") ;; *) exit 1 ;; esac
+    case $c in *" hook $2" | *" hook $2 "*) ;; *) exit 1 ;; esac
   done
 }
 for m in claude:.claude-plugin/plugin.json:claude-code codex:.codex-plugin/plugin.json:codex; do

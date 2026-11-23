@@ -20,7 +20,7 @@ PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:/home/linuxb
 export PATH
 unset _v _keep
 
-VERSION=0.8.0
+VERSION=0.8.1
 # Resolve our own path now: hooks may cd into the workspace later, which
 # would break a relative $0 such as Antigravity's ./bin/agentlog.
 SELF=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
@@ -332,7 +332,7 @@ agentlog — shared message board for agents working in the same repo
   agentlog install --remote URL | --no-remote  [--sync-repos 'GLOB ...']
                  sync boards with ssh://[user@]host/abs/path (or a directory); limit to
                  repo keys matching the globs, e.g. 'github.com/me/*' (default all)
-  agentlog sync [--quiet]                  sync this repo's board now (hooks do it every 10s)
+  agentlog sync [--quiet] [--wait]         sync now; --wait waits for an in-progress sync
   agentlog dashboard [--port P] [-n N] [--no-open]
                  live page of the board at http://127.0.0.1:P/ (P 0 = any free port);
                  opens it in the browser when run from a terminal
@@ -847,9 +847,14 @@ cmd_sync() {
     sync_status
     return
   fi
-  quiet=0
-  [ "${1:-}" = --quiet ] && quiet=1
-  [ $# -eq 0 ] || { [ $# -eq 1 ] && [ "$1" = --quiet ]; } || die 'sync: expected --quiet or status'
+  quiet=0 wait_sync=0
+  for arg in "$@"; do
+    case $arg in
+      --quiet) quiet=1 ;;
+      --wait) wait_sync=1 ;;
+      *) die 'sync: expected --quiet, --wait or status' ;;
+    esac
+  done
   ensure_store
   if [ -z "$W" ] || [ "$W" != "$STORE" ]; then die "sync: the shared store is not writable here"; fi
   remote=$(remote_url)
@@ -859,13 +864,20 @@ cmd_sync() {
   repo_synced "$key" || die "sync: $key is not in sync_repos ($(config_get sync_repos))"
   command -v rsync >/dev/null 2>&1 || die "sync: needs rsync"
   lock=$STORE/.sync.lock
-  if ! mkdir "$lock" 2>/dev/null; then
+  attempts=0
+  while ! mkdir "$lock" 2>/dev/null; do
     # A sync that died mid-way leaves its lock; two minutes is plenty.
     if [ -z "$(find "$lock" -prune -mmin +2 2>/dev/null)" ] || ! { rmdir "$lock" && mkdir "$lock"; } 2>/dev/null; then
-      [ $quiet -eq 1 ] && exit 0
+      if [ $wait_sync -eq 1 ] && [ $attempts -lt 120 ]; then
+        attempts=$((attempts + 1))
+        sleep 1
+        continue
+      fi
+      [ $quiet -eq 1 ] && [ $wait_sync -eq 0 ] && exit 0
       die "sync: another sync is running"
     fi
-  fi
+    break
+  done
   trap 'rm -rf "$TMP"; rmdir "$lock" 2>/dev/null' 0
   dest=$RPATH/$key
   if [ -n "$STORE_SUFFIX" ] && [ "$PROFILE_LAYOUT" = namespaced ]; then dest=$RPATH/profiles/$PROFILE/$key; fi
@@ -926,6 +938,10 @@ maybe_sync() {
   if [ "$W" != "$STORE" ] || [ -z "$(remote_url)" ]; then return 0; fi
   _k=$(repo_key) || return 0
   repo_synced "$_k" || return 0
+  if [ "${1:-}" = after-release ]; then
+    nohup "$SELF" sync --quiet --wait </dev/null >/dev/null 2>&1 &
+    return 0
+  fi
   last=$(cat "$STORE/.sync-at" 2>/dev/null || echo 0)
   case $last in '' | *[!0-9]*) last=0 ;; esac
   if [ $(($(now_epoch) - last)) -lt "$SYNC_SEC" ] &&
@@ -1341,6 +1357,13 @@ cmd_hook() {
   if [ -z "${AGENTLOG_DIR:-}" ] && ! git rev-parse --git-dir >/dev/null 2>&1; then exit 0; fi
   detect_identity
 
+  # StopFailure output cannot reach the model. Ignore other failures without
+  # consuming unread messages or changing presence.
+  if [ "$event" = StopFailure ]; then
+    [ "$agent" = claude-code ] && [ -n "$sid" ] || exit 0
+    [ "$(printf '%s' "$input" | json_field error)" = rate_limit ] || exit 0
+  fi
+
   ensure_store
   if [ -n "$first_call" ] && [ ! -f "$STORE/sessions/$SESSION" ] &&
     { [ -z "$LOCAL" ] || [ ! -f "$LOCAL/sessions/$SESSION" ]; }; then
@@ -1352,9 +1375,18 @@ cmd_hook() {
   [ -n "$W" ] || exit 0
 
   HOOKED=1
-  [ "$event" = SessionEnd ] || maybe_sync
+  case $event in SessionEnd | StopFailure) ;; *) maybe_sync ;; esac
   case $event in
     SessionStart | UserPromptSubmit) touch_presence ;;
+    StopFailure)
+      # Refresh first so stale claims are included in the durable release.
+      touch_presence
+      if active_claims | awk -F '\t' -v me="$SESSION" '$4 == me { f = 1 } END { exit !f }'; then
+        cmd_write -k release 'session stopped: rate_limit (subscription or API quota)' >/dev/null
+      fi
+      maybe_sync after-release
+      exit 0
+      ;;
     SessionEnd)
       # Release whatever this session still holds and drop its presence.
       if active_claims | awk -F '\t' -v me="$SESSION" '$4 == me { f = 1 } END { exit !f }'; then
