@@ -20,7 +20,7 @@ PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:/home/linuxb
 export PATH
 unset _v _keep
 
-VERSION=0.8.1
+VERSION=0.8.2
 # Resolve our own path now: hooks may cd into the workspace later, which
 # would break a relative $0 such as Antigravity's ./bin/agentlog.
 SELF=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
@@ -412,7 +412,7 @@ cmd_write() {
   if [ "$kind" = claim ]; then
     others=$(active_claims | awk -F '\t' -v me="$SESSION" '$4 != me')
     if [ -n "$others" ]; then
-      printf 'agentlog: other active claims — check for overlap:\n' >&2
+      printf 'agentlog: other active claims — compare intentions; compatible work can overlap in separate worktrees:\n' >&2
       printf '%s\n' "$others" | fmt_claims >&2
     fi
   fi
@@ -1054,7 +1054,7 @@ claim_warnings() { # claim_warnings FILES
   [ -n "$hits" ] || return 0
   mkdir -p "$W/nudged" 2>/dev/null || :
   printf '%s\n' "$hits" | cut -f1 >>"$nudged" 2>/dev/null || :
-  printf '%s\n' "agentlog: you just edited files inside another session's active claim. Check with its owner before going further (write -k request -t <session> ...), or leave the files alone."
+  printf '%s\n' "agentlog: this edit overlaps another session's claim. Compare intentions. Continue compatible work in separate worktrees and reconcile at merge. Pause affected work for incompatible plans (such as fixing code being deleted) or a risk of overwriting edits in the same working copy."
   printf '%s\n' "$hits" | while IFS=$tab read -r id f; do
     printf '%s\n' "$claims" | awk -F '\t' -v id="$id" '$1 == id' | fmt_claims
     printf '    you edited: %s\n' "$f"
@@ -1432,7 +1432,8 @@ cmd_hook() {
       done | head -1)
       [ -n "$others$claims$unread" ] || exit 0
       ctx="agentlog: other agents are working in this repo. You are $AGENT:$SHORT (session $SESSION).
-Use the agentlog skill. Command: $al (e.g. \`$al write -k claim -p 'src/foo/**' \"refactoring foo\"\`). Claim before larger edits; when finished, post \`done -r <claim-id>\`; reply to requests addressed to you."
+Use the agentlog skill. Command: $al (e.g. \`$al write -k claim -p 'src/foo/**' \"refactoring foo\"\`). Claim before larger edits; when finished, post \`done -r <claim-id>\`; reply to requests addressed to you.
+Claims coordinate intentions. Continue compatible overlapping work in separate worktrees and reconcile at merge. Pause affected work for incompatible plans or a risk of overwriting edits in the same working copy."
       [ -n "$claims" ] && ctx="$ctx
 
 Active claims:

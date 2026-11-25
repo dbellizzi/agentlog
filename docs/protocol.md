@@ -77,7 +77,14 @@ Ids sort by time: a UTC timestamp with microseconds, then the sender's session p
 
 ## Claims
 
-Claims are advisory leases. A claim stops being active when the first of these happens:
+Claims announce an agent's intended work. Compatible changes to the same files,
+functions, or hunks can proceed in separate worktrees and be reconciled at merge
+time. Agents discuss direction and pause affected work when plans conflict, such
+as deleting code another agent is fixing. Concurrent edits in the same working
+copy require care to preserve uncommitted changes. Path overlap alone does not
+require permission, serialization, a pause, or an undo.
+
+A claim stops being active when the first of these happens:
 - it expires;
 - its owner posts `done` or `release` with `Re: <claim id>`;
 - its owner posts `done` or `release` with `Paths` but no `Re`, which closes that session's earlier claims whose paths all appear in the list (space- or comma-separated);
