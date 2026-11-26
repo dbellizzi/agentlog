@@ -230,10 +230,41 @@ $AL write 'via sandbox fallback $t2'"
     has_n "$r" 2 ".agent == \"codex\" and (.body | contains(\"$t1\") or contains(\"$t2\"))"
 }
 
+# Run explicitly while the account is quota-blocked. A single real Claude turn
+# verifies its emitted event and the plugin's release without spending quota.
+s_quota() {
+  r=$(newrepo quota)
+  sid=$(uuidgen | tr '[:upper:]' '[:lower:]')
+  (cd "$r" && AGENTLOG_AGENT=claude-code AGENTLOG_SESSION=$sid "$AL" write -k claim -p 'quota/**' 'quota event verification') >/dev/null
+  # shellcheck disable=SC2016 # this is the capture script, expanded when run
+  printf '#!/bin/sh\ncat >"$1"\n' >"$work/quota-capture.sh"
+  settings=$(jq -nc --arg cmd "sh \"$work/quota-capture.sh\" \"$work/quota-event.json\"" \
+    '{enabledPlugins:{"agentlog@dbellizzi":false},hooks:{StopFailure:[{matcher:"rate_limit",hooks:[{type:"command",command:$cmd}]}]}}')
+  (cd "$r" && AGENTLOG_NO_INSTALL=1 CLAUDE_CODE_MAX_RETRIES=0 "$to" "$TIMEOUT" claude -p --session-id "$sid" \
+    --debug-file "$work/quota-debug.log" \
+    --plugin-dir "$plugin" --settings "$settings" 'Reply with OK.') >"$work/quota.log" 2>&1 || :
+  if [ ! -f "$work/quota-event.json" ]; then
+    bad 'quota: Claude emitted a rate_limit StopFailure event' "$work/quota.log"
+    return
+  fi
+  check 'quota: live event identifies the quota failure' "$work/quota-event.json" \
+    jq -e '.hook_event_name == "StopFailure" and .error == "rate_limit"' "$work/quota-event.json"
+  i=0
+  while [ $i -lt 30 ] && ! has "$r" ".kind == \"release\" and .session == \"$sid\" and (.body | contains(\"rate_limit\"))"; do
+    sleep 0.2
+    i=$((i + 1))
+  done
+  check 'quota: plugin releases the same session claim' "$work/quota.log" \
+    has "$r" ".kind == \"release\" and .session == \"$sid\" and (.body | contains(\"rate_limit\"))"
+  # shellcheck disable=SC2016 # positional parameters belong to the child shell
+  check 'quota: released claim is absent from active claims' "$work/quota.log" \
+    sh -c 'cd "$1" && ! "$2" claims | grep -q "quota/"' sh "$r" "$AL"
+}
+
 [ $# -gt 0 ] || set -- claude codex cross worktree muse antigravity
 for s in "$@"; do
   case $s in
-    claude | codex | cross | worktree | muse | antigravity) "s_$s" ;;
+    claude | codex | cross | worktree | muse | antigravity | quota) "s_$s" ;;
     *) die "unknown scenario '$s' (claude codex cross worktree muse antigravity)" ;;
   esac
 done

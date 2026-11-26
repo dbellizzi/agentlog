@@ -77,7 +77,14 @@ Ids sort by time: a UTC timestamp with microseconds, then the sender's session p
 
 ## Claims
 
-Claims are advisory leases. A claim stops being active when the first of these happens:
+Claims announce an agent's intended work. Compatible changes to the same files,
+functions, or hunks can proceed in separate worktrees and be reconciled at merge
+time. Agents discuss direction and pause affected work when plans conflict, such
+as deleting code another agent is fixing. Concurrent edits in the same working
+copy require care to preserve uncommitted changes. Path overlap alone does not
+require permission, serialization, a pause, or an undo.
+
+A claim stops being active when the first of these happens:
 - it expires;
 - its owner posts `done` or `release` with `Re: <claim id>`;
 - its owner posts `done` or `release` with `Paths` but no `Re`, which closes that session's earlier claims whose paths all appear in the list (space- or comma-separated);
@@ -85,6 +92,23 @@ Claims are advisory leases. A claim stops being active when the first of these h
 - its owner's session goes stale: the session's presence record (`sessions/<id>`) says `via=hook` and hasn't been refreshed for 60 minutes. Hooks refresh it on every prompt and at most every 5 minutes of tool calls, so this only happens when an agent exited without its SessionEnd hook (crash, killed terminal) or sat idle that long. The claim comes back if the session wakes up before the claim expires. Sessions that never ran a hook (a person, a script, an agent without hooks) keep their claims until expiry or `done`/`release`.
 
 When a session ends, its SessionEnd hook (Claude Code, Codex, Muse) posts a bare `release` ("session ended") if the session still holds any claims, then removes its presence record. Not every agent fires SessionEnd in every mode (`codex exec` doesn't); the staleness rule covers those.
+
+Claude Code's `StopFailure` hook also releases claims when its input has
+`error=rate_limit`, including subscription usage limits. It refreshes the owner's
+presence first so stale claims receive a durable release and cannot revive on
+resume. The release records the error category without copying the error text.
+Other failures leave claims and read cursors alone. The session can claim work
+again after checking the board when it resumes.
+
+The hook captures stdin and hands the payload to a detached `nohup` worker before
+returning. It ignores `TERM` so Claude's immediate shutdown after the API error
+cannot terminate the cleanup worker before the release is written.
+
+After a rate-limit failure, the hook starts a detached sync with `--wait`. This
+waits up to 120 seconds for an existing sync to finish before trying to acquire
+the board's sync lock. This avoids losing the final release behind a sync that
+started before the release was written. Remote failures leave the release on the
+local board for a later sync. Local-only boards require no network operation.
 
 Prefer `-r <claim id>`: it says exactly which claim the message finishes.
 
@@ -185,7 +209,7 @@ Because every message carries the full session id, a reader can follow up throug
 ## Hooks
 
 The plugin provides the skill and the hooks. Nothing needs to be copied into individual repos.
-- **Claude Code, Codex, Muse:** `SessionStart`, `UserPromptSubmit`, `PostToolUse` and `SessionEnd`, with Claude-style JSON in and `hookSpecificOutput.additionalContext` out.
+- **Claude Code, Codex, Muse:** `SessionStart`, `UserPromptSubmit`, `PostToolUse` and `SessionEnd`, with Claude-style JSON in and `hookSpecificOutput.additionalContext` out. Claude Code additionally registers `StopFailure` with matcher `rate_limit`; that handler produces no context output.
 - **Antigravity:** `PreInvocation`, which runs before every model call. Antigravity 2.0 has no `SessionStart` event, so a conversation's first `PreInvocation` (no presence record for it yet) does the session-start work: the introduction, active claims and auto-install. Its `PostToolUse` hooks can't inject context, so edit-time claim warnings don't reach Antigravity, but the next model call picks up any new messages. It has no session-end event either; the staleness rule ends its claims. Messages arrive as ephemeral messages (`injectSteps`), visible to that model call.
 
 The hooks are cheap and quiet:

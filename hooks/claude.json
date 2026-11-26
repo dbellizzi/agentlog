@@ -9,6 +9,9 @@
     "PostToolUse": [
       { "matcher": "*", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/agentlog\" hook claude-code" }] }
     ],
+    "StopFailure": [
+      { "matcher": "rate_limit", "hooks": [{ "type": "command", "command": "trap '' TERM; input=$(cat); printf '%s' \"$input\" | nohup \"${CLAUDE_PLUGIN_ROOT}/bin/agentlog\" hook claude-code >/dev/null 2>&1 &" }] }
+    ],
     "SessionEnd": [
       { "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/agentlog\" hook claude-code" }] }
     ]
